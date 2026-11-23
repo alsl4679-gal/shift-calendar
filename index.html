@@ -2,13 +2,24 @@
 <html lang="ko">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <meta name="theme-color" content="#1f3a5f">
   <meta name="description" content="광고 없는 4조 2교대 근무 달력 — 휴가·대근 실시간 공유">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="교대달력">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
-  <link rel="manifest" href="manifest.webmanifest">
+  <script>
+    // 가족 보기 주소(?family= / ?fv=)에서는 manifest 를 넣지 않음.
+    // 아이폰은 홈 화면 추가 때 manifest 의 시작 주소(./)를 써서 가족 연결 정보가 빠지기 때문.
+    (function () {
+      var fam = /[?&](family|fv)=/.test(location.search);
+      try {
+        var hasSession = Object.keys(localStorage).some(function (k) { return /^sb-.*-auth-token$/.test(k); });
+        if (!fam && !hasSession && localStorage.getItem('familyViewer')) fam = true;
+      } catch (e) { /* 무시 */ }
+      if (!fam) { var l = document.createElement('link'); l.rel = 'manifest'; l.href = 'manifest.webmanifest'; document.head.appendChild(l); }
+    })();
+  </script>
   <link rel="icon" type="image/png" href="icons/icon-192.png">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
   <link rel="stylesheet" href="css/style.css">

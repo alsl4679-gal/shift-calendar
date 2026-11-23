@@ -1,6 +1,6 @@
 -- 교대달력 DB 구조 (Supabase 프로젝트 shift-calendar 에 이미 적용됨)
 -- 새 프로젝트에 다시 만들 때만 SQL Editor에서 실행하세요.
--- 적용 이력: init_shift_schema, lock_internal_functions, invite_code_check, jo_history, work_types, custom_type_auto, team_create_code_and_transfer, member_approval, operator_and_admin_invite, family_share, team_events, team_polls, part_leader_and_jo_scope (위에서 아래 순서대로 실행)
+-- 적용 이력: init_shift_schema, lock_internal_functions, invite_code_check, jo_history, work_types, custom_type_auto, team_create_code_and_transfer, member_approval, operator_and_admin_invite, family_share, team_events, team_polls, part_leader_and_jo_scope, team_crew_size, memo_colors_and_shortage_requests, cover_assignment, cover_assignment_fixes (위에서 아래 순서대로 실행)
 -- work_types 는 Supabase 대시보드 Database > Migrations 의 'work_types' 항목과 같습니다 (대시보드 Database > Migrations 에서도 확인 가능)
 
 -- ===== Tables =====
@@ -646,3 +646,9 @@ alter publication supabase_realtime add table public.member_jo_history;
 -- part_leader_and_jo_scope: members.is_part(파트장), _is_super()=파트장|운영자, _jo_now()
 --   approve_member/remove_member: 주임은 자기 조만, 파트장·운영자는 전체 / set_member_jo(타인): 파트장·운영자만
 --   set_member_role: 파트장 권한은 운영자만 변경 / transfer_admin: 파트장은 불가 / set_part_leader(): 운영자만
+-- team_crew_size: teams.crew_size(조별 정원, null=인원부족 표시 안 함), set_crew_size() — 관리자·파트장·운영자
+-- memo_colors_and_shortage_requests: personal_notes.memo_colors(메모 줄별 색), cover_requests.kind('absence'|'shortage')·requester_id null 허용,
+--   volunteer_shortage() 인원부족 지원(정원 미달일 때만), confirm/unconfirm: 인원부족은 그 근무 조 주임·파트장·운영자, 지원자 0명이면 요청 취소, 반 이름 압연·냉각
+-- cover_assignment: status 'assigned'(주임 지정·확인 대기), assigned_by, assign_cover()/assign_shortage()/accept_cover()/cancel_assignment()
+--   지원자를 지정하면 바로 확정, 아니면 본인이 확인해야 확정
+-- cover_assignment_fixes: unvolunteer_cover 지정 건 보호, volunteer_shortage 지정 건이면 지원 막음

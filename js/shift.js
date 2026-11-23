@@ -118,7 +118,8 @@ export function periodStats(team, joAt, startIso, endIso, overridesByDate) {
   const n = daysBetween(startIso, endIso);
   for (let i = 0; i <= n; i++) {
     const iso = addDays(startIso, i);
-    const { shift, isCover } = effectiveShift(team, joAt(iso), iso, overridesByDate[iso]);
+    const jo = joAt(iso);
+    const { shift, isCover } = effectiveShift(team, jo, iso, overridesByDate[iso]);
     if (!shift) continue;
     const info = SHIFT_INFO[shift];
     if (shift === 'D' || shift === 'N') {
@@ -126,7 +127,7 @@ export function periodStats(team, joAt, startIso, endIso, overridesByDate) {
       s.workHours += info.hours;
       s.nightHours += info.nightHours;
       if (shift === 'D') s.day++; else s.night++;
-      if (isCover) { s.cover++; s.coverHours += info.hours; }
+      if (isCover || (jo && baseShift(team, jo, iso) === 'O')) { s.cover++; s.coverHours += info.hours; }
     } else if (ABSENCE.has(shift)) {
       s.abs[shift]++;
       if (shift === 'V') s.vacation++;

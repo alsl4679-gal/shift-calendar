@@ -15,14 +15,16 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const todayISO = () => S.toISO(new Date());
 const nowYM = () => { const d = new Date(); return { y: d.getFullYear(), m: d.getMonth() }; };
-const BANS = ['가열', '압연', '냉각', '시험'];
+const BANS = ['가열', '압연·냉각', '시험'];
 const VAC_TYPES = ['연차', '병가', '경조', '공가', '기타'];
+const MEMO_COLORS = ['#40a35a', '#228be6', '#7950f2', '#e64980', '#e03131', '#f76707', '#fab005', '#495057'];
 
 const state = {
   user: null, me: null, team: null, isOperator: false, family: false, events: [], members: [], memberMap: new Map(), joHist: new Map(), customTypes: new Map(),
-  tab: 'mine', ym: nowYM(), infoYm: nowYM(),
+  tab: 'mine', ym: nowYM(),
+  infoYm: (() => { try { return localStorage.getItem('statMode') === 'pay' ? payYM() : nowYM(); } catch { return nowYM(); } })(),
   overrides: new Map(), requests: [], upcoming: [], volunteers: new Map(), notes: new Map(), nearReqs: [],
-  polls: [], pollVotes: new Map(), coverCounts: new Map(),
+  polls: [], pollVotes: new Map(), coverCounts: new Map(), myAssigned: [],
   yearOverrides: null, channel: null, openSheet: null, installPrompt: null,
 };
 
@@ -53,7 +55,21 @@ const installDismissed = () => { try { return localStorage.getItem('installDismi
 const holidayTag = (iso) => (HOLIDAYS[iso] ? ` <span class="holiday-tag">${HOLIDAYS[iso]}</span>` : '');
 function shiftOf(member, iso) {
   const jo = joAt(member.user_id, iso);
-  return { ...S.effectiveShift(state.team, jo, iso, state.overrides.get(okey(member.user_id, iso))), jo };
+  const ov = state.overrides.get(okey(member.user_id, iso));
+  const s = S.effectiveShift(state.team, jo, iso, ov);
+  // 대근 = 확정된 대근 + 원래 쉬는 날 근무 (인원부족 대근·직접 입력)
+  const extra = s.isCover || (!!ov && !!jo && (s.shift === 'D' || s.shift === 'N') && S.baseShift(state.team, jo, iso) === 'O');
+  return { ...s, jo, extra };
+}
+/** 조별 정원 (팀 설정, 없으면 인원부족 표시 안 함) */
+const crewSize = () => state.team?.crew_size || 0;
+/** 그날 주간·야간 실제 인원과 부족 수 (파트장 제외) */
+function staffing(iso) {
+  const n = crewSize();
+  if (!n) return null;
+  const c = { D: 0, N: 0 };
+  for (const mem of shiftMembers()) { const k = shiftOf(mem, iso).shift; if (k === 'D' || k === 'N') c[k]++; }
+  return { c, D: Math.max(0, n - c.D), N: Math.max(0, n - c.N) };
 }
 
 // ---------- 공통 UI ----------
@@ -139,21 +155,36 @@ function shiftBadge(shift, isCover = false, extra = '', custom = null) {
 }
 const baseLabel = (b) => (b === 'AUTO' ? '자동 (앞뒤 근무)' : S.SHIFT_INFO[b].label);
 const baseShort = (b) => (b === 'AUTO' ? '자동' : S.SHIFT_INFO[b].short);
-/** 내 달력 칸: 첫 메모 + 나머지 개수 */
-function memoBar(memo) {
-  const lines = (memo || '').split('\n').map((x) => x.trim()).filter(Boolean);
-  if (!lines.length) return '';
-  return `<span class="memo-bar"><span class="mtxt">${esc(lines[0])}</span>${lines.length > 1 ? `<b class="mcount">+${lines.length - 1}</b>` : ''}</span>`;
+/** 메모 줄 + 색 */
+function memoItems(note) {
+  return (note?.memo || '').split('\n').map((t, i) => ({ t, c: note?.memo_colors?.[i] || MEMO_COLORS[0] })).filter((x) => x.t.trim());
+}
+/** 내 달력 칸: 첫 메모 띠 (메모 색), 더 있으면 아래에 ⁝ */
+function memoBar(note) {
+  const items = memoItems(note);
+  if (!items.length) return '';
+  const c = items[0].c;
+  return `<span class="memo-bar" style="background:${c};color:${textOn(c)}"><span class="mtxt">${esc(items[0].t)}</span></span>${
+    items.length > 1 ? `<span class="memo-more" style="--mc:${items[1].c}" title="메모 ${items.length}개"><i></i><i></i><i></i></span>` : ''}`;
 }
 /** 내 달력용: 그날 내 커스텀 타입 (팀 달력에는 쓰지 않음) */
 function myCustom(iso) {
   const ov = state.overrides.get(okey(state.user.id, iso));
   return ov?.custom_type_id ? state.customTypes.get(ov.custom_type_id) || null : null;
 }
-function monthNav(ym, action) {
+/** 내 정보 집계 기준: 'cal' 달력(1일~말일) | 'pay' 15일 마감(16일~다음 달 15일) */
+const statMode = () => { try { return localStorage.getItem('statMode') === 'pay' ? 'pay' : 'cal'; } catch { return 'cal'; } };
+/** 15일 마감: 이 날짜가 속한 정산 달 (16일부터는 다음 달) */
+function payYM(iso = todayISO()) {
+  const d = S.fromISO(iso);
+  const dt = new Date(d.getFullYear(), d.getMonth() + (d.getDate() >= 16 ? 1 : 0), 1);
+  return { y: dt.getFullYear(), m: dt.getMonth() };
+}
+const payRange = (y, m) => ({ start: S.toISO(new Date(y, m - 1, 16)), end: S.toISO(new Date(y, m, 15)) });
+function monthNav(ym, action, label = null) {
   return `<div class="month-nav">
     <button class="icon-btn" data-action="${action}" data-d="-1" aria-label="이전 달">${ICONS.prev}</button>
-    <h2>${ym.y}년 ${ym.m + 1}월</h2>
+    <h2>${label ?? `${ym.y}년 ${ym.m + 1}월`}</h2>
     <button class="icon-btn" data-action="${action}" data-d="1" aria-label="다음 달">${ICONS.next}</button>
     <button class="chip-btn" data-action="${action}" data-d="0">오늘</button>
   </div>`;
@@ -173,12 +204,12 @@ async function boot() {
     else refresh({ team: true, quiet: true });
   });
   sb.auth.onAuthStateChange((event) => {
-    if (event === 'SIGNED_OUT') { teardown(); state.user = null; renderAuth(); }
+    if (event === 'SIGNED_OUT') { teardown(); state.user = null; if (getFamilyToken()) renderFamily(); else renderAuth(); }
   });
   try {
     const params = new URLSearchParams(location.search);
     if (params.get('family')) return claimFamily(params.get('family'));
-    if (params.get('fv')) setFamilyToken(params.get('fv'));
+    if (params.get('fv')) { setFamilyToken(params.get('fv')); return renderFamily(); }
     const { data: { session } } = await sb.auth.getSession();
     if (!session) return getFamilyToken() ? renderFamily() : renderAuth();
     state.user = session.user;
@@ -245,7 +276,7 @@ async function loadMonth() {
   const tid = state.team.id;
   const wd = S.workDateNow();
   const pollsP = loadPolls();
-  const [ov, mine, rq, nt, up, evq, near] = await Promise.all([
+  const [ov, mine, rq, nt, up, evq, near, asg] = await Promise.all([
     sb.from('day_overrides').select('*').eq('team_id', tid).gte('work_date', from).lte('work_date', to),
     sb.from('day_overrides').select('*').eq('user_id', state.user.id).gte('work_date', wd).lte('work_date', S.addDays(wd, 1)),
     sb.from('cover_requests').select('*').eq('team_id', tid).neq('status', 'cancelled')
@@ -255,8 +286,10 @@ async function loadMonth() {
       .gte('work_date', todayISO()).order('work_date').limit(30),
     sb.from('team_events').select('*').eq('team_id', tid).lte('start_date', to).gte('end_date', from).order('start_date'),
     sb.from('cover_requests').select('*').eq('team_id', tid).neq('status', 'cancelled').gte('work_date', wd).lte('work_date', S.addDays(wd, 1)),
+    sb.from('cover_requests').select('*').eq('filled_by', state.user.id).eq('status', 'assigned').gte('work_date', wd).order('work_date'),
   ]);
-  for (const r of [ov, mine, rq, nt, up, evq, near]) if (r.error) throw r.error;
+  for (const r of [ov, mine, rq, nt, up, evq, near, asg]) if (r.error) throw r.error;
+  state.myAssigned = asg.data;
   await pollsP;
   state.nearReqs = near.data;
   state.coverCounts = await loadCoverCounts(coverPeriod(todayISO()));
@@ -279,7 +312,7 @@ async function loadMonth() {
 
 async function loadYear(y) {
   const { data, error } = await sb.from('day_overrides').select('work_date,shift,is_cover')
-    .eq('user_id', state.user.id).gte('work_date', `${y}-01-01`).lte('work_date', `${y}-12-31`);
+    .eq('user_id', state.user.id).gte('work_date', `${y - 1}-12-16`).lte('work_date', `${y}-12-31`);
   if (error) throw error;
   state.yearOverrides = { year: y, map: Object.fromEntries(data.map((o) => [o.work_date, o])) };
 }
@@ -310,6 +343,10 @@ let rtMembers = false;
 let rtToasts = [];
 let rtPending = null;
 let rtPoll = null;
+let rtMine = null;
+let rtAssigned = null;
+let rtAccepted = null;
+let rtSelfAccept = null;
 function subscribe() {
   if (state.channel) sb.removeChannel(state.channel);
   const ch = sb.channel(`team-${state.team.id}`);
@@ -323,6 +360,11 @@ function onRealtime(p) {
   if (p.table === 'members' || p.table === 'member_jo_history') rtMembers = true;
   if (p.table === 'members' && p.eventType === 'INSERT' && p.new?.status === 'pending'
       && (isSuper() || (isAdmin() && p.new.jo && p.new.jo === curJo(state.me)))) rtPending = p.new;
+  if (p.table === 'cover_requests' && p.eventType === 'UPDATE' && p.new?.status === 'filled' && p.new.filled_by === state.user.id
+      && p.new.id !== rtSelfAccept) rtMine = p.new;
+  if (p.table === 'cover_requests' && p.eventType === 'UPDATE' && p.new?.status === 'assigned' && p.new.filled_by === state.user.id) rtAssigned = p.new;
+  if (p.table === 'cover_requests' && p.eventType === 'UPDATE' && p.new?.status === 'filled' && p.new.assigned_by === state.user.id
+      && p.new.filled_by !== state.user.id) rtAccepted = p.new;
   if (p.table === 'polls' && p.eventType === 'INSERT' && p.new?.created_by !== state.user.id
       && (!p.new.target_jo || p.new.target_jo === curJo(state.me))) rtPoll = p.new;
   const n = p.new;
@@ -336,6 +378,21 @@ function onRealtime(p) {
     const team = rtMembers; rtMembers = false;
     const toasts = rtToasts; rtToasts = [];
     await refresh({ team, quiet: true });
+    if (rtAssigned) {
+      const c = rtAssigned; rtAssigned = null;
+      toast(`📋 ${S.formatDay(c.work_date)} ${S.SHIFT_INFO[c.shift].label} 대근에 지정됐어요. 확인해 주세요`, { label: '확인하기', fn: () => { state.tab = 'mine'; closeSheet(); renderApp(); } }, 10000);
+      return;
+    }
+    if (rtAccepted) {
+      const c = rtAccepted; rtAccepted = null;
+      toast(`✅ ${memberName(c.filled_by)}님이 ${S.formatDay(c.work_date)} ${S.SHIFT_INFO[c.shift].label} 대근을 확인했어요`, { label: '보기', fn: () => goTeamDay(c.work_date) }, 7000);
+      return;
+    }
+    if (rtMine) {
+      const c = rtMine; rtMine = null;
+      toast(`✅ ${S.formatDay(c.work_date)} ${S.SHIFT_INFO[c.shift].label} 대근이 확정됐어요`, { label: '보기', fn: () => goTeamDay(c.work_date) }, 8000);
+      return;
+    }
     if (rtPoll) {
       const pl = rtPoll; rtPoll = null;
       toast(`🗳 새 투표: ${pl.title}`, { label: '투표하기', fn: () => { state.tab = 'team'; renderApp(); openPollSheet(pl.id); } }, 8000);
@@ -347,6 +404,10 @@ function onRealtime(p) {
       return;
     }
     const r = toasts[toasts.length - 1];
+    if (r?.kind === 'shortage') {
+      if (isAdmin() || isSuper()) toast(`${S.formatDay(r.work_date)} ${S.SHIFT_INFO[r.shift].label} 인원부족 대근 지원이 들어왔어요`, { label: '보기', fn: () => goTeamDay(r.work_date) }, 7000);
+      return;
+    }
     if (r) {
       toast(`${memberName(r.requester_id)}님 ${S.formatDay(r.work_date)} ${S.SHIFT_INFO[r.shift].label} 휴가 — 대근 필요`,
         { label: '보기', fn: () => goTeamDay(r.work_date) }, 7000);
@@ -398,14 +459,16 @@ const empFields = `
 const pwFields = `
   <label>비밀번호 <small class="muted">6자 이상</small><input name="password" type="password" minlength="6" autocomplete="new-password" required></label>
   <label>비밀번호 확인<input name="password2" type="password" minlength="6" autocomplete="new-password" required></label>`;
-const teamFields = (factory = DEFAULT_FACTORY, ban = '압연') => `
+const teamFields = (factory = DEFAULT_FACTORY, ban = '압연·냉각') => `
   <label>공장<input name="factory" maxlength="40" value="${esc(factory)}" required></label>
   ${banField(ban)}`;
 
 function authShell(inner, small = false) {
   return `<div class="auth">
     <div class="brand ${small ? 'small' : ''}"><img src="icons/icon-192.png" alt=""><h1>교대달력</h1>
-      <p class="muted">광고 없는 우리 반 교대 근무표</p></div>${inner}</div>`;
+      <p class="muted">광고 없는 우리 반 교대 근무표</p></div>
+    ${isSamsung() && !isStandalone() ? `<div class="note warn samsung-note">삼성 인터넷에서는 홈 화면 추가가 잘 안 돼요. <b>크롬에서 열어</b> 로그인·가입해 주세요.
+      <a class="btn primary block" href="${chromeIntentUrl()}">크롬으로 열기</a></div>` : ''}${inner}</div>`;
 }
 
 /** 새 계정 만들기 (직번 → 내부 주소) */
@@ -475,7 +538,12 @@ function renderAuth(mode = 'login', ctx = {}) {
     wireBanField($app.querySelector('#f'));
   }
   $app.querySelectorAll('[data-go]').forEach((b) => { b.onclick = () => renderAuth(b.dataset.go, ctx); });
-  if (mode === 'login') { try { const last = localStorage.getItem('lastEmp'); if (last) $app.querySelector('input[name=emp]').value = last; } catch { /* 무시 */ } }
+  if (mode === 'login') {
+    try { const last = localStorage.getItem('lastEmp'); if (last) $app.querySelector('input[name=emp]').value = last; } catch { /* 무시 */ }
+    $app.querySelector('.auth')?.insertAdjacentHTML('beforeend', `<p class="note fam-hint">👨‍👩‍👧 <b>가족 보기 링크로 들어왔는데 이 화면이 보이나요?</b>
+      로그인하지 마세요. 근무자에게 새 링크를 받아 ${/iphone|ipad/i.test(navigator.userAgent) ? 'Safari' : '크롬'}에서 열고,
+      그 화면에서 홈 화면에 추가해 주세요.</p>`);
+  }
 
   const form = $app.querySelector('#f');
   form.onsubmit = async (e) => {
@@ -675,7 +743,7 @@ $app.addEventListener('click', async (e) => {
   if (act === 'month' || act === 'info-month') {
     const key = act === 'month' ? 'ym' : 'infoYm';
     const d = +a.dataset.d;
-    if (d === 0) state[key] = nowYM();
+    if (d === 0) state[key] = act === 'info-month' && statMode() === 'pay' ? payYM() : nowYM();
     else {
       const dt = new Date(state[key].y, state[key].m + d, 1);
       state[key] = { y: dt.getFullYear(), m: dt.getMonth() };
@@ -693,6 +761,12 @@ $app.addEventListener('click', async (e) => {
   else if (act === 'events') openEventsSheet();
   else if (act === 'poll') openPollSheet(a.dataset.id);
   else if (act === 'cover-stats') openCoverStatsSheet();
+  else if (act === 'accept-cover') reqAction('accept', a.dataset.id, null, a.dataset.iso, { reopen: false });
+  else if (act === 'stat-mode') {
+    try { localStorage.setItem('statMode', a.dataset.mode); } catch { /* 무시 */ }
+    state.infoYm = a.dataset.mode === 'pay' ? payYM() : nowYM();
+    renderApp();
+  }
   else if (act === 'poll-new') openPollEditSheet();
   else if (act === 'poll-past') openPollListSheet();
   else if (act === 'approve' || act === 'reject') {
@@ -720,6 +794,16 @@ $app.addEventListener('click', async (e) => {
     try { localStorage.setItem('installDismissed', '1'); } catch { /* 무시 */ }
     if (state.family) drawFamily(); else renderApp();
   }
+  else if (act === 'logout-others') {
+    if (!(await confirmModal('이 폰을 뺀 나머지 기기에서 내 계정을 로그아웃할까요? 가족 보기 연결은 그대로예요.', '로그아웃'))) return;
+    await withBusy(async () => {
+      try {
+        const { error } = await sb.auth.signOut({ scope: 'others' });
+        if (error) throw error;
+        toast('다른 기기를 로그아웃했어요. 이미 열려 있던 화면은 길어야 1시간 안에 끊겨요', null, 7000);
+      } catch (e) { toastErr(e); }
+    });
+  }
   else if (act === 'logout') { if (await confirmModal('로그아웃할까요?', '로그아웃')) sb.auth.signOut(); }
   else if (act === 'leave') leaveTeam();
 });
@@ -739,9 +823,12 @@ function coverInfo(iso, s) {
   const list = reqs.filter((r) => r.shift === s.shift && r.requester_id !== state.user.id)
     .sort((a, b) => (a.status === 'filled') - (b.status === 'filled'));
   if (!list.length) return { html: '<span class="tc-none">대근 없음</span>' };
-  return { link: true, html: `<span class="tc-h">대근 ${list.length}</span>${list.slice(0, 2).map((r) => (r.status === 'filled'
-    ? `<span class="tc-row filled"><b>${nm(r.filled_by)}</b><small>←${nm(r.requester_id)}</small></span>`
-    : `<span class="tc-row open"><b>${nm(r.requester_id)}</b><small>자리 비어요</small></span>`)).join('')}${list.length > 2 ? `<small class="muted">외 ${list.length - 2}건</small>` : ''}` };
+  return { link: true, html: `<span class="tc-h">대근 ${list.length}</span>${list.slice(0, 2).map((r) => (r.status === 'assigned'
+    ? `<span class="tc-row open"><b>${nm(r.filled_by)}</b><small>확인 대기</small></span>`
+    : r.status === 'filled'
+    ? `<span class="tc-row filled"><b>${nm(r.filled_by)}</b><small>←${r.kind === 'shortage' ? '인원부족' : nm(r.requester_id)}</small></span>`
+    : r.kind === 'shortage' ? '<span class="tc-row open"><b>인원부족</b><small>지원 대기</small></span>'
+      : `<span class="tc-row open"><b>${nm(r.requester_id)}</b><small>자리 비어요</small></span>`)).join('')}${list.length > 2 ? `<small class="muted">외 ${list.length - 2}건</small>` : ''}` };
 }
 
 function viewMine() {
@@ -757,22 +844,24 @@ function viewMine() {
     const dow = S.fromISO(iso).getDay();
     return `<button class="cell ${iso === today ? 'today' : ''} ${s.changed ? 'changed' : ''}" data-action="mine-day" data-iso="${iso}">
       ${cellHead(iso, dow)}
-      ${shiftBadge(s.shift, s.isCover, '', myCustom(iso))}
+      ${shiftBadge(s.shift, s.extra, '', myCustom(iso))}
       ${eventBar(iso)}
-      ${memoBar(note?.memo)}
+      ${memoBar(note)}
     </button>`;
   }).join('');
   const card = (label, s, iso) => {
     const c = coverInfo(iso, s);
     return `<div class="today-item" ${c.link ? `data-action="goto-req" data-iso="${iso}"` : ''}>
       <span class="muted">${label}</span>
-      <div class="ti-row">${shiftBadge(s.shift, s.isCover, 'lg', myCustom(iso))}<div class="ti-cover">${c.html}</div></div>
+      <div class="ti-row">${shiftBadge(s.shift, s.extra, 'lg', myCustom(iso))}<div class="ti-cover">${c.html}</div></div>
       <span class="t-time">${s.shift ? (S.SHIFT_INFO[s.shift].time || (S.ABSENCE.has(s.shift) ? S.SHIFT_INFO[s.shift].label : '쉬는 날')) : ''}</span></div>`;
   };
   return `<header class="top"><div><h1>${esc(state.me.display_name)} <small>${joLabel(curJo(state.me))}</small></h1>
       <p class="muted">${esc(state.team.factory_name)} · ${esc(state.team.ban_name)}반</p></div></header>
-    ${!isStandalone() && !installDismissed() ? `<div class="install-banner"><span>📲 홈 화면에 추가하면 앱처럼 바로 열 수 있어요</span>
-      <button class="chip-btn" data-action="install-guide">방법 보기</button><button class="x-btn" data-action="install-dismiss" aria-label="닫기">✕</button></div>` : ''}
+    ${installBanner()}
+    ${state.myAssigned.length ? `<section class="assign-banner"><h4>📋 확인할 대근 ${state.myAssigned.length}건</h4>${state.myAssigned.map((r) => `<div class="assign-row">
+      <span><b>${S.formatDay(r.work_date)} ${S.SHIFT_INFO[r.shift].label}</b> <small>${r.kind === 'shortage' ? '인원부족' : `${esc(memberName(r.requester_id))} 자리`} · ${esc(memberName(r.assigned_by))} 지정</small></span>
+      <button class="btn primary sm" data-action="accept-cover" data-id="${r.id}" data-iso="${r.work_date}">확인</button></div>`).join('')}</section>` : ''}
     <section class="today-card">${card(`오늘 ${S.formatDay(wd)}`, t0, wd)}${card('내일', t1, S.addDays(wd, 1))}</section>
     ${monthNav(state.ym, 'month')}
     ${WEEK_HEAD}
@@ -788,8 +877,9 @@ function openMineSheet(iso) {
   const note = state.notes.get(iso) || null;
   let sel = { ...cur };
   let vtype = note?.vacation_type || '';
-  let memos = (note?.memo || '').split('\n').filter((x) => x.trim());
-  if (!memos.length) memos = [''];
+  let memos = memoItems(note);
+  if (!memos.length) memos = [{ t: '', c: MEMO_COLORS[0] }];
+  let palFor = -1;
 
   const draw = () => {
     const customs = [...state.customTypes.values()];
@@ -811,24 +901,32 @@ function openMineSheet(iso) {
       <div class="sub-label">내 근무 타입 <em>나만 보는 이름표</em><button class="link-btn inline" data-edit-types>편집</button></div>
       <div class="chips">${customs.length ? customs.map((c) => `<button class="chip custom ${sel.custom === c.id ? 'on' : ''}" data-c="${c.id}"
           style="--c:${c.color};--cf:${textOn(c.color)}">${esc(c.name)} <small>${baseShort(c.base_shift)}</small></button>`).join('')
-        : '<span class="muted small-note">아직 없어요. 편집에서 만들 수 있어요 (예: 압대, 냉대).</span>'}</div>
+        : '<span class="muted small-note">아직 없어요. 편집에서 만들 수 있어요 (예: 교대지정휴무).</span>'}</div>
       ${selCustom && selCustom.base_shift === 'AUTO' && base === 'O' ? `<p class="auto-line">→ 앞뒤 근무 기준으로 <b>${S.SHIFT_INFO[sel.shift].label}</b>에 들어가요
         <button class="link-btn inline2" data-flip>${sel.shift === 'D' ? '야간' : '주간'}으로 바꾸기</button></p>` : ''}
       ${!isBase ? `<button class="link-btn" data-reset>원래 근무(${S.SHIFT_INFO[base].label})로 되돌리기</button>` : ''}
       ${sel.shift === 'V' ? `<div class="field"><span class="field-label">휴가 종류 <em>나만 보기</em></span>
         <div class="chips">${VAC_TYPES.map((v) => `<button class="chip ${vtype === v ? 'on' : ''}" data-v="${v}">${v}</button>`).join('')}</div></div>` : ''}
-      <div class="field"><span class="field-label">메모 <em>나만 보기 · 달력엔 첫 메모 + 개수</em></span>
-        <div class="memo-list">${memos.map((m, i) => `<div class="memo-item"><input data-memo="${i}" maxlength="80" value="${esc(m)}"
-          placeholder="${i === 0 ? '예: 병원 예약 10시' : '메모 추가'}"><button class="x-btn" data-mdel="${i}" aria-label="메모 삭제">✕</button></div>`).join('')}</div>
+      <div class="field"><span class="field-label">메모 <em>나만 보기 · 달력엔 첫 메모, 더 있으면 ⁝</em></span>
+        <div class="memo-list">${memos.map((m, i) => `<div class="memo-item"><button class="memo-color" data-mcol="${i}" style="background:${m.c}" aria-label="메모 색"></button>
+          <input data-memo="${i}" maxlength="80" value="${esc(m.t)}" placeholder="${i === 0 ? '예: 병원 예약 10시' : '메모 추가'}"><button class="x-btn" data-mdel="${i}" aria-label="메모 삭제">✕</button></div>
+          ${palFor === i ? `<div class="memo-pal">${MEMO_COLORS.map((c) => `<button class="${c === m.c ? 'on' : ''}" data-mpick="${c}" style="background:${c}"></button>`).join('')}
+            <label class="memo-pick" style="background:${MEMO_COLORS.includes(m.c) ? '#fff' : m.c}">🎨<input type="color" value="${m.c}" data-mpicker></label></div>` : ''}`).join('')}</div>
         ${memos.length < 5 ? '<button class="link-btn" data-madd>+ 메모 추가</button>' : ''}</div>
       <p class="note">${noteText}</p>
       <div class="row-btns"><button class="btn ghost" data-close>닫기</button><button class="btn primary" data-save>저장</button></div>
     `, { type: 'mine', iso });
-    const keep = () => { memos = [...sh.querySelectorAll('[data-memo]')].map((el) => el.value); };
-    sh.querySelector('[data-madd]')?.addEventListener('click', () => { keep(); memos.push(''); draw(); sh.querySelector(`[data-memo="${memos.length - 1}"]`); });
-    sh.querySelectorAll('[data-mdel]').forEach((b) => {
-      b.onclick = () => { keep(); memos.splice(+b.dataset.mdel, 1); if (!memos.length) memos = ['']; draw(); };
+    const keep = () => { memos = [...sh.querySelectorAll('[data-memo]')].map((el, i) => ({ t: el.value, c: memos[i]?.c || MEMO_COLORS[0] })); };
+    sh.querySelector('[data-madd]')?.addEventListener('click', () => {
+      keep(); memos.push({ t: '', c: memos[memos.length - 1]?.c || MEMO_COLORS[0] }); palFor = -1; draw();
+      sh.querySelector(`[data-memo="${memos.length - 1}"]`)?.focus();
     });
+    sh.querySelectorAll('[data-mdel]').forEach((b) => {
+      b.onclick = () => { keep(); memos.splice(+b.dataset.mdel, 1); if (!memos.length) memos = [{ t: '', c: MEMO_COLORS[0] }]; palFor = -1; draw(); };
+    });
+    sh.querySelectorAll('[data-mcol]').forEach((b) => { b.onclick = () => { keep(); palFor = palFor === +b.dataset.mcol ? -1 : +b.dataset.mcol; draw(); }; });
+    sh.querySelectorAll('[data-mpick]').forEach((b) => { b.onclick = () => { keep(); memos[palFor].c = b.dataset.mpick; palFor = -1; draw(); }; });
+    sh.querySelector('[data-mpicker]')?.addEventListener('change', (e) => { keep(); memos[palFor].c = e.target.value; palFor = -1; draw(); });
     sh.querySelectorAll('[data-s]').forEach((b) => { b.onclick = () => { keep(); sel = { shift: b.dataset.s, custom: null }; draw(); }; });
     sh.querySelectorAll('[data-c]').forEach((b) => {
       b.onclick = () => {
@@ -844,17 +942,23 @@ function openMineSheet(iso) {
     sh.querySelector('[data-flip]')?.addEventListener('click', () => { keep(); sel = { ...sel, shift: sel.shift === 'D' ? 'N' : 'D' }; draw(); });
     sh.querySelector('[data-edit-types]').onclick = () => openCustomTypesSheet(iso);
     sh.querySelector('[data-close]').onclick = closeSheet;
-    sh.querySelector('[data-save]').onclick = () => { keep(); saveMine({ iso, base, cur, ov, note, sel, vtype, memo: memos.map((x) => x.trim()).filter(Boolean).join('\n') }); };
+    sh.querySelector('[data-save]').onclick = () => {
+      keep();
+      const kept = memos.map((x) => ({ t: x.t.trim(), c: x.c })).filter((x) => x.t);
+      saveMine({ iso, base, cur, ov, note, sel, vtype, memo: kept.map((x) => x.t).join('\n'), colors: kept.map((x) => x.c) });
+    };
   };
   draw();
 }
 
-async function saveMine({ iso, base, cur, ov, note, sel, vtype, memo }) {
+async function saveMine({ iso, base, cur, ov, note, sel, vtype, memo, colors = [] }) {
   const shiftChanged = sel.shift !== cur.shift || (sel.custom || null) !== (cur.custom || null);
   if (ov?.is_cover && shiftChanged && !(await confirmModal('확정된 대근이 취소됩니다. 계속할까요?', '계속'))) return;
   const newVt = sel.shift === 'V' ? (vtype || null) : null;
   const newMemo = memo.trim() || null;
-  const noteChanged = (note?.memo || null) !== newMemo || (note?.vacation_type || null) !== newVt;
+  const newColors = newMemo ? colors : null;
+  const noteChanged = (note?.memo || null) !== newMemo || (note?.vacation_type || null) !== newVt
+    || JSON.stringify(note?.memo_colors || null) !== JSON.stringify(newColors);
   if (!shiftChanged && !noteChanged) return closeSheet();
   await withBusy(async () => {
     try {
@@ -864,7 +968,7 @@ async function saveMine({ iso, base, cur, ov, note, sel, vtype, memo }) {
         });
         if (error) throw error;
       }
-      if (noteChanged) await writeNote(iso, newMemo, newVt);
+      if (noteChanged) await writeNote(iso, newMemo, newVt, newColors);
       closeSheet();
       await loadMonth();
       renderApp();
@@ -876,10 +980,10 @@ async function saveMine({ iso, base, cur, ov, note, sel, vtype, memo }) {
   });
 }
 
-async function writeNote(iso, memo, vt) {
+async function writeNote(iso, memo, vt, colors = null) {
   if (memo || vt) {
     const { error } = await sb.from('personal_notes').upsert(
-      { user_id: state.user.id, work_date: iso, memo, vacation_type: vt, updated_at: new Date().toISOString() },
+      { user_id: state.user.id, work_date: iso, memo, vacation_type: vt, memo_colors: memo ? colors : null, updated_at: new Date().toISOString() },
       { onConflict: 'user_id,work_date' });
     if (error) throw error;
   } else {
@@ -894,7 +998,7 @@ async function undoMine(iso, prev, prevNote) {
       const custom = prev.custom && state.customTypes.has(prev.custom) ? prev.custom : null;
       const { error } = await sb.rpc('set_my_shift', { p_date: iso, p_shift: prev.shift, p_custom: custom });
       if (error) throw error;
-      await writeNote(iso, prevNote?.memo || null, prevNote?.vacation_type || null);
+      await writeNote(iso, prevNote?.memo || null, prevNote?.vacation_type || null, prevNote?.memo_colors || null);
       await loadMonth();
       renderApp();
       toast('되돌렸어요');
@@ -949,7 +1053,7 @@ function openCustomTypesSheet(returnIso, editId = null) {
       <button class="btn danger-ghost sm" data-del="${c.id}">삭제</button></span></li>`).join('')}</ul>` : ''}
     <form id="ctf" class="form ctype-form">
       <h4>${editing ? `"${esc(editing.name)}" 수정` : '새 타입 추가'}</h4>
-      <label>이름 <small class="muted">최대 6자</small><input name="name" maxlength="6" value="${esc(editing?.name || '')}" placeholder="예: 압대" required></label>
+      <label>이름 <small class="muted">최대 6자</small><input name="name" maxlength="6" value="${esc(editing?.name || '')}" placeholder="예: 교대지정휴무" required></label>
       <label>기준 근무 <small class="muted">팀 달력에 이렇게 보여요</small><select name="base">
         <option value="AUTO" ${(editing?.base_shift || 'AUTO') === 'AUTO' ? 'selected' : ''}>자동 — 근무일은 그 근무, 쉬는 날은 앞뒤 근무(주/야) · 대근용</option>
         ${S.FIXED_TYPES.map((k) => `<option value="${k}" ${editing?.base_shift === k ? 'selected' : ''}>${S.SHIFT_INFO[k].label}</option>`).join('')}
@@ -1099,16 +1203,18 @@ async function loadCoverCounts(per) {
     .eq('team_id', state.team.id).in('shift', ['D', 'N']).gte('work_date', per.start).lte('work_date', per.end);
   if (error) throw error;
   const map = new Map();
+  map.days = [];
   for (const o of data || []) {
     const jo = joAt(o.user_id, o.work_date);
     if (!o.is_cover && (!jo || S.baseShift(state.team, jo, o.work_date) !== 'O')) continue;
+    map.days.push(o);
     const r = map.get(o.user_id) || { n: 0, d: 0, nt: 0, app: 0 };
     r.n++; if (o.shift === 'D') r.d++; else r.nt++; if (o.is_cover) r.app++;
     map.set(o.user_id, r);
   }
   return map;
 }
-async function openCoverStatsSheet(shift = 0, jo = '') {
+async function openCoverStatsSheet(shift = 0, jo = '', view = 'list') {
   const per = coverPeriod(todayISO(), shift);
   let counts;
   try { counts = shift === 0 ? state.coverCounts : await loadCoverCounts(per); } catch (e) { return toastErr(e); }
@@ -1125,16 +1231,41 @@ async function openCoverStatsSheet(shift = 0, jo = '') {
       <button class="icon-btn" data-cs="1" aria-label="다음 기간">${ICONS.next}</button>
       ${shift ? '<button class="chip-btn" data-cs="0">이번</button>' : ''}</div>
     <div class="chips">${['', ...S.JOS].map((j) => `<button class="chip ${j === jo ? 'on' : ''}" data-csjo="${j}">${j ? `${j}조` : '전체'}</button>`).join('')}</div>
-    <p class="muted small-note">합계 ${total}회 · 1인 평균 ${avg}회 · 많은 순</p>
-    <div class="cs-list">${rows.map(({ mm, c }) => `<div class="cs-row ${mm.user_id === state.user.id ? 'me' : ''}">
+    <div class="seg sm"><button class="${view === 'list' ? 'on' : ''}" data-csview="list">사람별</button><button class="${view === 'cal' ? 'on' : ''}" data-csview="cal">달력</button></div>
+    <p class="muted small-note">합계 ${total}회 · 1인 평균 ${avg}회${view === 'list' ? ' · 많은 순' : ' · 날짜를 누르면 그날 팀 달력'}</p>
+    ${view === 'list' ? `<div class="cs-list">${rows.map(({ mm, c }) => `<div class="cs-row ${mm.user_id === state.user.id ? 'me' : ''}">
       <span class="cs-name">${esc(mm.display_name)} <small>${curJo(mm) ?? ''}</small></span>
       <span class="po-bar"><i style="width:${Math.round((c.n / max) * 100)}%"></i></span>
-      <span class="cs-n"><span><b>${c.n}</b>회</span>${c.n ? `<small>주${c.d}·야${c.nt}</small>` : ''}</span></div>`).join('')}</div>
-    <p class="note">앱에서 확정된 대근 + 쉬는 날 근무로 직접 입력한 것(압대·냉대 등)을 함께 셉니다.</p>
+      <span class="cs-n"><span><b>${c.n}</b>회</span>${c.n ? `<small>주${c.d}·야${c.nt}</small>` : ''}</span></div>`).join('')}</div>`
+      : coverCalendar(per, (counts.days || []).filter((o) => { const mm = state.memberMap.get(o.user_id); return mm && !mm.is_part && (!jo || curJo(mm) === jo); }))}
+    <p class="note">앱에서 확정된 대근 + 쉬는 날 근무로 직접 입력한 것을 함께 셉니다.</p>
     <div class="row-btns"><button class="btn ghost block" data-close>닫기</button></div>`, { type: 'coverStats' });
   sh.querySelector('[data-close]').onclick = closeSheet;
-  sh.querySelectorAll('[data-cs]').forEach((b) => { b.onclick = () => openCoverStatsSheet(+b.dataset.cs === 0 ? 0 : shift + +b.dataset.cs, jo); });
-  sh.querySelectorAll('[data-csjo]').forEach((b) => { b.onclick = () => openCoverStatsSheet(shift, b.dataset.csjo); });
+  sh.querySelectorAll('[data-cs]').forEach((b) => { b.onclick = () => openCoverStatsSheet(+b.dataset.cs === 0 ? 0 : shift + +b.dataset.cs, jo, view); });
+  sh.querySelectorAll('[data-csjo]').forEach((b) => { b.onclick = () => openCoverStatsSheet(shift, b.dataset.csjo, view); });
+  sh.querySelectorAll('[data-csview]').forEach((b) => { b.onclick = () => openCoverStatsSheet(shift, jo, b.dataset.csview); });
+  sh.querySelectorAll('[data-csday]').forEach((b) => { b.onclick = () => { closeSheet(); goTeamDay(b.dataset.csday); }; });
+}
+/** 집계 기간(16일~15일) 달력: 날짜마다 대근한 사람 */
+function coverCalendar(per, days) {
+  const byDay = new Map();
+  for (const o of days) { if (!byDay.has(o.work_date)) byDay.set(o.work_date, []); byDay.get(o.work_date).push(o); }
+  const first = S.addDays(per.start, -S.fromISO(per.start).getDay());
+  const n = S.daysBetween(first, per.end);
+  const cells = [];
+  for (let i = 0; i <= n + (6 - S.fromISO(per.end).getDay()); i++) {
+    const iso = S.addDays(first, i);
+    if (iso < per.start || iso > per.end) { cells.push('<span class="cc-cell empty"></span>'); continue; }
+    const list = (byDay.get(iso) || []).sort((a, b) => a.shift.localeCompare(b.shift));
+    const d = S.fromISO(iso);
+    const label = d.getDate() === 1 || iso === per.start ? `${d.getMonth() + 1}/${d.getDate()}` : d.getDate();
+    cells.push(`<button class="cc-cell ${iso === todayISO() ? 'today' : ''}" data-csday="${iso}">
+      <span class="cc-d ${HOLIDAYS[iso] || d.getDay() === 0 ? 'sun' : d.getDay() === 6 ? 'sat' : ''}">${label}</span>
+      ${list.slice(0, 3).map((o) => `<span class="cc-name s-${o.shift}">${esc(memberName(o.user_id))}</span>`).join('')}
+      ${list.length > 3 ? `<span class="cc-more">+${list.length - 3}</span>` : ''}</button>`);
+  }
+  return `${WEEK_HEAD}<div class="cc-grid">${cells.join('')}</div>
+    <p class="legend"><span class="cc-name s-D inline">주간</span> <span class="cc-name s-N inline">야간</span> 대근</p>`;
 }
 
 // ---------- 투표 (회식 참석 조사 등) ----------
@@ -1357,18 +1488,19 @@ function viewTeam() {
     const reqs = dayRequests(iso);
     const open = reqs.filter((r) => r.status === 'open').length;
     const filled = reqs.filter((r) => r.status === 'filled').length;
-    const vac = shiftMembers().filter((mem) => S.ABSENCE.has(shiftOf(mem, iso).shift)).length;
+    const assigned = reqs.filter((r) => r.status === 'assigned').length;
+    const st = staffing(iso);
     const mine = shiftOf(state.me, iso);
     const dow = S.fromISO(iso).getDay();
     return `<button class="cell tcell ${iso === today ? 'today' : ''}" data-action="team-day" data-iso="${iso}">
       ${cellHead(iso, dow, mine.shift === 'D' || mine.shift === 'N' ? `<i class="me-dot s-${mine.shift}"></i>` : '')}
-      <span class="duty"><i class="d">${duty.D.join('')}</i><i class="n">${duty.N.join('')}</i></span>
-      ${open ? `<span class="pill open">대근${open}</span>` : filled ? `<span class="pill filled">확정${filled}</span>` : vac ? `<span class="pill vac">부재${vac}</span>` : ''}
+      <span class="duty"><i class="d${st?.D ? ' short' : ''}"${st?.D ? ` data-s="-${st.D}"` : ''}>${duty.D.join('')}</i><i class="n${st?.N ? ' short' : ''}"${st?.N ? ` data-s="-${st.N}"` : ''}>${duty.N.join('')}</i></span>
+      ${open ? `<span class="pill open">대근${open}</span>` : assigned ? `<span class="pill assigned">지정${assigned}</span>` : filled ? `<span class="pill filled">확정${filled}</span>` : ''}
       ${eventStrip(iso)}
     </button>`;
   }).join('');
   const up = state.upcoming.slice(0, 8).map((r) => `<button class="req-chip" data-action="goto-req" data-iso="${r.work_date}">
-      <b>${S.formatDay(r.work_date)}</b> ${S.SHIFT_INFO[r.shift].label} · ${esc(memberName(r.requester_id))}
+      <b>${S.formatDay(r.work_date)}</b> ${S.SHIFT_INFO[r.shift].label} · ${r.kind === 'shortage' ? '인원부족' : esc(memberName(r.requester_id))}
       <span class="muted">지원 ${(state.volunteers.get(r.id) || []).length}</span></button>`).join('');
   return `<header class="top"><div><h1>팀 달력</h1>
       <p class="muted">${esc(state.team.factory_name)} · ${esc(state.team.ban_name)}반 · ${activeMembers().length}명</p></div>
@@ -1386,7 +1518,8 @@ function viewTeam() {
     ${WEEK_HEAD}
     <div class="grid">${cells}</div>
     <p class="legend"><span class="duty inline"><i class="d">A</i></span>주간 조 <span class="duty inline"><i class="n">D</i></span>야간 조
-      <span class="pill open">대근</span>필요 <span class="pill filled">확정</span>완료 <i class="me-dot s-D inline"></i>내 근무</p>`;
+      <span class="pill open">대근</span>필요 <span class="pill assigned">지정</span>확인 대기 <span class="pill filled">확정</span>완료 <i class="me-dot s-D inline"></i>내 근무
+      ${crewSize() ? `<span class="duty inline"><i class="d short" data-s="-1">A</i></span>인원부족 (정원 ${crewSize()}명)` : ''}</p>`;
 }
 
 function openTeamSheet(iso) {
@@ -1401,51 +1534,99 @@ function openTeamSheet(iso) {
   const prevMine = shiftOf(state.me, S.addDays(iso, -1)).shift;
   const nextMine = shiftOf(state.me, S.addDays(iso, 1)).shift;
 
+  const statusTag = (r) => (r.status === 'assigned'
+    ? `<span class="tag assigned">지정 · ${esc(memberName(r.filled_by))} 확인 대기</span>`
+    : `<span class="tag filled">대근 확정 · ${esc(memberName(r.filled_by))}</span>`);
   const reqCard = (r) => {
     const vols = state.volunteers.get(r.id) || [];
-    const mineReq = r.requester_id === state.user.id;
-    const canManage = mineReq || isAdmin();
+    const short = r.kind === 'shortage';
+    const mineReq = !short && r.requester_id === state.user.id;
+    const dutyJo = short ? S.josOnDuty(state.team, iso)[r.shift]?.[0] : null;
+    // 인원부족: 그 근무 조 주임·파트장·운영자 / 휴가: 등록자·관리자
+    const canManage = short ? (isSuper() || (isAdmin() && curJo(state.me) === dutyJo)) : (mineReq || isAdmin());
+    // 직접 지정: 인원부족은 그 근무 조 주임, 휴가 대근은 관리자 (휴가 본인은 지정 불가)
+    const canAssign = short ? canManage : (isAdmin() || isSuper());
     const iVol = vols.some((v) => v.user_id === state.user.id);
     let actions = '';
     if (r.status === 'open') {
       if (!mineReq) {
         if (iVol) actions += `<button class="btn ghost sm" data-req="unvol" data-id="${r.id}">지원 취소</button>`;
-        else if (myShift === 'O') {
+        else if (myShift === 'O' && !(short && isPart())) {
           const warn = (r.shift === 'D' && prevMine === 'N') ? '전날 야간 근무 직후예요'
             : (r.shift === 'N' && nextMine === 'D') ? '다음 날 주간 근무가 이어져요' : '';
           actions += `<button class="btn primary sm" data-req="vol" data-id="${r.id}">대근 지원</button>${warn ? `<span class="warn-text">${warn}</span>` : ''}`;
         } else actions += '<span class="muted">그날 근무가 있어 지원할 수 없어요</span>';
       }
+      if (canAssign) actions += `<button class="btn ghost sm" data-assign="${r.id}">대근자 지정</button>`;
+    } else if (r.status === 'assigned') {
+      if (r.filled_by === state.user.id) actions += `<button class="btn primary sm" data-req="accept" data-id="${r.id}">확인</button><span class="warn-text">${esc(memberName(r.assigned_by))} 주임이 지정했어요</span>`;
+      if (canAssign) actions += `<button class="btn ghost sm" data-req="cancelassign" data-id="${r.id}">지정 취소</button>`;
     } else if (r.status === 'filled' && (canManage || r.filled_by === state.user.id)) {
       actions += `<button class="btn ghost sm" data-req="unconfirm" data-id="${r.id}">확정 취소</button>`;
     }
     const volList = vols.length ? `<ul class="vols">${vols.map((v) => {
       const mm = state.memberMap.get(v.user_id);
       const confirmBtn = r.status === 'open' && canManage
-        ? `<button class="btn primary sm" data-req="confirm" data-id="${r.id}" data-uid="${v.user_id}">확정</button>` : '';
+        ? `<button class="btn primary sm" data-req="confirm" data-id="${r.id}" data-uid="${v.user_id}">${vols.length === 1 ? '승인' : '이 사람으로'}</button>` : '';
       const cnt = canManage ? (state.coverCounts.get(v.user_id)?.n ?? 0) : null;
       return `<li><span>${esc(mm?.display_name ?? '(나간 사람)')} <small>${joAt(v.user_id, iso) ?? ''}조${cnt !== null ? ` · 이번 기간 대근 ${cnt}회` : ''}</small></span>${confirmBtn}</li>`;
     }).join('')}</ul>` : (r.status === 'open' ? '<p class="muted small-note">아직 지원자가 없어요</p>' : '');
+    const pickHint = r.status === 'open' && vols.length ? (canManage
+      ? `<p class="muted small-note">${vols.length === 1 ? '지원자를 승인하면 대근이 확정돼요.' : `지원자 ${vols.length}명 중 넣을 사람을 골라 주세요.`}</p>`
+      : `<p class="muted small-note">${short ? `${dutyJo}조 주임이` : '휴가 등록자나 관리자가'} 확정해요.</p>`) : '';
+    if (short) {
+      return `<div class="req-card short ${r.status}">
+        <div class="req-head"><b>인원부족</b> <small>${dutyJo ?? ''}조</small> <span class="tag s-${r.shift}">${S.SHIFT_INFO[r.shift].label}</span>
+          ${r.status === 'open' ? '<span class="tag open">지원 받는 중</span>' : statusTag(r)}</div>
+        ${r.status === 'open' ? volList + pickHint : ''}
+        ${actions ? `<div class="req-actions">${actions}</div>` : ''}
+      </div>`;
+    }
     const req = state.memberMap.get(r.requester_id);
     const absShift = state.overrides.get(okey(r.requester_id, iso))?.shift;
     const absLabel = S.ABSENCE.has(absShift) ? S.SHIFT_INFO[absShift].label : '휴가';
     return `<div class="req-card ${r.status}">
       <div class="req-head"><b>${esc(req?.display_name ?? '(나간 사람)')}</b> <small>${joAt(r.requester_id, iso) ?? ''}조</small>
         <span class="tag s-${r.shift}">${S.SHIFT_INFO[r.shift].label}</span><span class="tag s-${S.ABSENCE.has(absShift) ? absShift : 'V'}">${absLabel}</span>
-        ${r.status === 'open' ? '<span class="tag open">대근 필요</span>' : `<span class="tag filled">대근 확정 · ${esc(memberName(r.filled_by))}</span>`}</div>
-      ${r.status === 'open' ? volList : ''}
+        ${r.status === 'open' ? '<span class="tag open">대근 필요</span>' : statusTag(r)}</div>
+      ${r.status === 'open' ? volList + pickHint : ''}
       ${actions ? `<div class="req-actions">${actions}</div>` : ''}
     </div>`;
   };
+  const absReqs = reqs.filter((r) => r.kind !== 'shortage');
+  const shortReqs = (k) => reqs.filter((r) => r.kind === 'shortage' && r.shift === k);
 
-  const byJo = (list) => S.JOS.map((jo) => {
-    const ps = list.filter((x) => x.jo === jo);
-    if (!ps.length) return '';
-    return `<div class="jo-row"><span class="jo-tag">${jo}조</span>${ps.map((x) => `<span class="person ${x.mem.user_id === state.user.id ? 'me' : ''}">
-      ${esc(x.mem.display_name)}${x.isCover ? '<em class="cover-tag">대근</em>' : x.changed ? '<em>변경</em>' : ''}</span>`).join('')}</div>`;
-  }).join('') || '<p class="muted small-note">없음</p>';
+  const byJo = (list) => {
+    const rows = S.JOS.map((jo) => {
+      const ps = list.filter((x) => x.jo === jo && !x.extra);
+      if (!ps.length) return '';
+      return `<div class="jo-row"><span class="jo-tag">${jo}조</span>${ps.map((x) => `<span class="person ${x.mem.user_id === state.user.id ? 'me' : ''}">
+        ${esc(x.mem.display_name)}${x.changed ? '<em>변경</em>' : ''}</span>`).join('')}</div>`;
+    }).join('');
+    const covers = list.filter((x) => x.extra);
+    const coverRow = covers.length ? `<div class="jo-row cover-row"><span class="jo-tag cover">대근</span>${covers.map((x) => `<span class="person cover ${x.mem.user_id === state.user.id ? 'me' : ''}">
+      ${esc(x.mem.display_name)}<small>${x.jo ?? ''}조</small></span>`).join('')}</div>` : '';
+    return rows + coverRow || '<p class="muted small-note">없음</p>';
+  };
+  const st = staffing(iso);
+  const canFill = !isPart() && myShift === 'O' && iso >= S.workDateNow();
+  const shiftHead = (k) => {
+    const cnt = groups[k].length;
+    if (!st) return `<small class="muted">${cnt}명</small>`;
+    return `<small class="muted">${cnt}/${crewSize()}명</small>${st[k] ? ` <span class="tag short">${st[k]}명 부족</span>` : ''}`;
+  };
+  const fillBtn = (k) => {
+    const cards = shortReqs(k).map(reqCard).join('');
+    // 이미 진행 중(지원 받는 중·지정)인 인원부족이 있으면 그 카드에서 처리
+    if (!st?.[k] || shortReqs(k).some((r) => r.status === 'open' || r.status === 'assigned')) return cards;
+    const canAssignShort = iso >= S.workDateNow() && (isSuper() || (isAdmin() && curJo(state.me) === duty[k]?.[0]));
+    const warn = (k === 'D' && prevMine === 'N') ? '전날 야간 근무 직후예요' : (k === 'N' && nextMine === 'D') ? '다음 날 주간 근무가 이어져요' : '';
+    const btns = (canFill ? `<button class="btn primary sm" data-fill="${k}">${S.SHIFT_INFO[k].label} 인원부족 대근 지원</button>` : '')
+      + (canAssignShort ? `<button class="btn ghost sm" data-assign-short="${k}">대근자 지정</button>` : '');
+    return btns ? `${cards}<div class="req-actions">${btns}${canFill && warn ? `<span class="warn-text">${warn}</span>` : ''}</div>` : cards;
+  };
 
-  const reqUserIds = new Set(reqs.map((r) => r.requester_id));
+  const reqUserIds = new Set(absReqs.map((r) => r.requester_id));
   const otherVac = groups.A.filter((x) => !reqUserIds.has(x.mem.user_id));
   const duty = S.josOnDuty(state.team, iso);
 
@@ -1453,37 +1634,96 @@ function openTeamSheet(iso) {
     <h3>${S.formatDay(iso)}${holidayTag(iso)} <small class="muted">주간 ${duty.D.join('')}조 · 야간 ${duty.N.join('')}조</small></h3>
     ${eventsLine(iso)}
     ${pollsLine(iso)}
-    ${reqs.length || otherVac.length ? `<section class="sec"><h4>자리 비움 · 대근</h4>
-      ${reqs.map(reqCard).join('')}
+    ${absReqs.length || otherVac.length ? `<section class="sec"><h4>자리 비움 · 대근</h4>
+      ${absReqs.map(reqCard).join('')}
       ${otherVac.map((x) => `<div class="req-card plain"><b>${esc(x.mem.display_name)}</b> <small>${x.jo ?? ''}조</small> <span class="tag s-${x.shift}">${S.SHIFT_INFO[x.shift].label}</span> <span class="muted">쉬는 날이라 대근 불필요</span></div>`).join('')}
     </section>` : ''}
-    <section class="sec"><h4>${shiftBadge('D')} 주간 07~19 <small class="muted">${groups.D.length}명</small></h4>${byJo(groups.D)}</section>
-    <section class="sec"><h4>${shiftBadge('N')} 야간 19~07 <small class="muted">${groups.N.length}명</small></h4>${byJo(groups.N)}</section>
+    <section class="sec"><h4>${shiftBadge('D')} 주간 07~19 ${shiftHead('D')}</h4>${byJo(groups.D)}${fillBtn('D')}</section>
+    <section class="sec"><h4>${shiftBadge('N')} 야간 19~07 ${shiftHead('N')}</h4>${byJo(groups.N)}${fillBtn('N')}</section>
     <details class="sec"><summary><h4>${shiftBadge('O')} 휴무 <small class="muted">${groups.O.length}명</small></h4></summary>${byJo(groups.O)}</details>
     <div class="row-btns"><button class="btn ghost block" data-close>닫기</button></div>
   `, { type: 'team', iso });
   sh.querySelector('[data-close]').onclick = closeSheet;
   sh.querySelectorAll('[data-req]').forEach((b) => { b.onclick = () => reqAction(b.dataset.req, b.dataset.id, b.dataset.uid, iso); });
   sh.querySelectorAll('[data-pid]').forEach((b) => { b.onclick = () => openPollSheet(b.dataset.pid); });
+  sh.querySelectorAll('[data-assign]').forEach((b) => {
+    b.onclick = () => { const r = reqs.find((x) => x.id === b.dataset.assign); openAssignSheet(iso, r.shift, r); };
+  });
+  sh.querySelectorAll('[data-assign-short]').forEach((b) => { b.onclick = () => openAssignSheet(iso, b.dataset.assignShort, null); });
+  sh.querySelectorAll('[data-fill]').forEach((b) => {
+    b.onclick = async () => {
+      const k = b.dataset.fill;
+      if (!(await confirmModal(`${S.formatDay(iso)} ${S.SHIFT_INFO[k].label} 인원부족 대근에 지원할까요? 그 조 주임이 확정하면 내 달력에 "대근"으로 들어가요.`, '지원'))) return;
+      await withBusy(async () => {
+        try {
+          const { error } = await sb.rpc('volunteer_shortage', { p_date: iso, p_shift: k });
+          if (error) throw error;
+          await loadMonth(); renderApp(); openTeamSheet(iso);
+          toast('지원했어요. 주임이 확정하면 알려 드려요');
+        } catch (e) { toastErr(e); }
+      });
+    };
+  });
 }
 
-async function reqAction(kind, id, uid, iso) {
+/** 대근자 지정: 그날 쉬는 반원을 이번 기간 대근 적은 순으로 */
+function openAssignSheet(iso, shift, r) {
+  const vols = new Set((r ? state.volunteers.get(r.id) || [] : []).map((v) => v.user_id));
+  const list = shiftMembers().filter((mm) => mm.user_id !== r?.requester_id && shiftOf(mm, iso).shift === 'O')
+    .map((mm) => ({ mm, n: state.coverCounts.get(mm.user_id)?.n ?? 0, vol: vols.has(mm.user_id) }))
+    .sort((a, b) => b.vol - a.vol || a.n - b.n || a.mm.display_name.localeCompare(b.mm.display_name, 'ko'));
+  const prev = S.addDays(iso, -1); const next = S.addDays(iso, 1);
+  const sh = openSheet(`<h3>대근자 지정 <small class="muted">${S.formatDay(iso)} ${S.SHIFT_INFO[shift].label}</small></h3>
+    <p class="muted small-note">${r?.kind === 'absence' || (r && r.requester_id) ? `${esc(memberName(r.requester_id))} 자리 · ` : '인원부족 · '}그날 쉬는 사람만 보여요. 이번 기간 대근 적은 순.</p>
+    <p class="note">지원자를 고르면 바로 확정되고, 지원 안 한 사람을 고르면 그 사람이 <b>확인</b>을 눌러야 확정돼요.</p>
+    ${list.length ? `<div class="assign-list">${list.map(({ mm, n, vol }) => {
+      const p = shiftOf(mm, prev).shift; const nx = shiftOf(mm, next).shift;
+      const warn = (shift === 'D' && p === 'N') ? '전날 야간' : (shift === 'N' && nx === 'D') ? '다음 날 주간' : '';
+      return `<button class="assign-item" data-pick="${mm.user_id}"><span><b>${esc(mm.display_name)}</b> <small>${curJo(mm) ?? ''}조</small>
+        ${vol ? '<em class="vol-tag">지원함</em>' : ''}${warn ? `<em class="warn-tag">${warn}</em>` : ''}</span><span class="muted">대근 ${n}회</span></button>`;
+    }).join('')}</div>` : '<p class="muted small-note">그날 쉬는 반원이 없어요.</p>'}
+    <div class="row-btns"><button class="btn ghost block" data-back>돌아가기</button></div>`, { type: 'assign' });
+  sh.querySelector('[data-back]').onclick = () => openTeamSheet(iso);
+  sh.querySelectorAll('[data-pick]').forEach((b) => {
+    b.onclick = async () => {
+      const uid = b.dataset.pick; const vol = vols.has(uid);
+      if (!(await confirmModal(vol ? `지원자 ${memberName(uid)}님으로 대근을 확정할까요?` : `${memberName(uid)}님을 대근자로 지정할까요? 그분이 확인을 누르면 확정돼요.`, vol ? '확정' : '지정'))) return;
+      await withBusy(async () => {
+        try {
+          const { data, error } = r ? await sb.rpc('assign_cover', { p_request: r.id, p_user: uid })
+            : await sb.rpc('assign_shortage', { p_date: iso, p_shift: shift, p_user: uid });
+          if (error) throw error;
+          await loadMonth(); renderApp(); openTeamSheet(iso);
+          toast(data === 'filled' ? `${memberName(uid)}님으로 확정했어요` : `${memberName(uid)}님에게 지정했어요. 확인을 기다려요`);
+        } catch (e) { toastErr(e); }
+      });
+    };
+  });
+}
+
+async function reqAction(kind, id, uid, iso, { reopen = true } = {}) {
   if (kind === 'unconfirm' && !(await confirmModal('대근 확정을 취소할까요? 다시 "대근 필요"로 바뀝니다.', '확정 취소'))) return;
+  if (kind === 'accept' && !(await confirmModal(`${S.formatDay(iso)} 대근을 확인할까요? 내 달력에 "대근"으로 들어가요.`, '확인'))) return;
+  if (kind === 'cancelassign' && !(await confirmModal('지정을 취소할까요? 다시 "대근 필요"로 돌아가요.', '지정 취소'))) return;
   if (kind === 'confirm' && !(await confirmModal(`${memberName(uid)}님으로 대근을 확정할까요? 그분 달력에도 바로 "대근"으로 들어갑니다.`, '확정'))) return;
   const call = {
     vol: () => sb.rpc('volunteer_cover', { p_request: id }),
     unvol: () => sb.rpc('unvolunteer_cover', { p_request: id }),
     confirm: () => sb.rpc('confirm_cover', { p_request: id, p_user: uid }),
     unconfirm: () => sb.rpc('unconfirm_cover', { p_request: id }),
+    accept: () => sb.rpc('accept_cover', { p_request: id }),
+    cancelassign: () => sb.rpc('cancel_assignment', { p_request: id }),
   }[kind];
+  if (kind === 'accept') rtSelfAccept = id;
   await withBusy(async () => {
     try {
       const { error } = await call();
       if (error) throw error;
       await loadMonth();
       renderApp();
-      openTeamSheet(iso);
-      toast({ vol: '대근 지원했어요', unvol: '지원을 취소했어요', confirm: '대근을 확정했어요', unconfirm: '확정을 취소했어요' }[kind]);
+      if (reopen) openTeamSheet(iso);
+      toast({ vol: '대근 지원했어요', unvol: '지원을 취소했어요', confirm: '대근을 확정했어요', unconfirm: '확정을 취소했어요',
+        accept: '대근을 확인했어요. 내 달력에 들어갔어요', cancelassign: '지정을 취소했어요' }[kind]);
     } catch (e) { toastErr(e); }
   });
 }
@@ -1501,10 +1741,17 @@ async function fillInfo() {
   } catch (e) { root.innerHTML = `<p class="muted">${esc(translateErr(e.message))}</p>`; return; }
   if (state.tab !== 'info') return;
   const map = state.yearOverrides.map;
-  const { start, end } = S.monthRange(y, m);
+  const pay = statMode() === 'pay';
+  const { start, end } = pay ? payRange(y, m) : S.monthRange(y, m);
   const myJoAt = (iso) => joAt(state.user.id, iso);
   const ms = S.periodStats(state.team, myJoAt, start, end, map);
-  const ys = S.periodStats(state.team, myJoAt, `${y}-01-01`, `${y}-12-31`, map);
+  const ys = pay ? S.periodStats(state.team, myJoAt, `${y - 1}-12-16`, `${y}-12-15`, map)
+    : S.periodStats(state.team, myJoAt, `${y}-01-01`, `${y}-12-31`, map);
+  const absTotal = ['V', 'E', 'H', 'T', 'R'].reduce((t, k) => t + ms.abs[k], 0);
+  const absTile = `<div class="tile"><span class="muted">비근무</span><b>${absTotal}<small>일</small></b>
+    <span class="abs-grid">${['V', 'E', 'H', 'R', 'T'].map((k) => `<span class="${ms.abs[k] ? '' : 'zero'}">${S.SHIFT_INFO[k].label} <b>${ms.abs[k]}</b></span>`).join('')}</span></div>`;
+  const yearTile = `<div class="tile"><span class="muted">${y}년 누적${pay ? ` <small>(${y - 1}.12.16~12.15)</small>` : ''}</span>
+    <span class="year-line">휴가 <b>${ys.vacation}</b>일</span><span class="year-line">대근 <b>${ys.cover}</b>회</span></div>`;
   const tile = (label, val, unit = '', sub = '') => `<div class="tile"><span class="muted">${label}</span><b>${val}<small>${unit}</small></b>${sub ? `<span class="sub">${sub}</span>` : ''}</div>`;
 
   const personBtn = (mm) => `<button class="person ${mm.user_id === state.user.id ? 'me' : ''}"
@@ -1528,16 +1775,18 @@ async function fillInfo() {
       <div><h4>내 조 · ${joLabel(curJo(state.me))}</h4><p class="muted small-note">${joHistoryText(state.user.id)}</p></div>
       <button class="btn ghost sm" data-action="change-jo" data-uid="${state.user.id}">조 변경</button>
     </section>
-    ${monthNav(state.infoYm, 'info-month')}
+    <div class="seg"><button class="${pay ? '' : 'on'}" data-action="stat-mode" data-mode="cal">달력 기준<small>1일~말일</small></button>
+      <button class="${pay ? 'on' : ''}" data-action="stat-mode" data-mode="pay">15일 마감<small>16일~다음 달 15일</small></button></div>
+    ${monthNav(state.infoYm, 'info-month', pay ? `${m + 1}월 정산 <small>${md(start)}~${md(end)}</small>` : null)}
     <div class="tiles">
       ${tile('총 근무', ms.workHours, '시간', `${ms.workDays}일`)}
       ${tile('주간 / 야간', `${ms.day} / ${ms.night}`, '회')}
       ${tile('야간 시간 (22~06시)', ms.nightHours, '시간')}
       ${tile('대근', ms.cover, '회', `${ms.coverHours}시간`)}
-      ${tile('휴가', ms.abs.V, '일', ['E', 'H', 'T', 'R'].filter((k) => ms.abs[k]).map((k) => `${S.SHIFT_INFO[k].label} ${ms.abs[k]}`).join(' · '))}
-      ${tile(`${y}년 누적`, `휴가 ${ys.vacation}일`, '', `대근 ${ys.cover}회`)}
+      ${absTile}
+      ${yearTile}
     </div>
-    <p class="note">근무표 기준 <b>참고용</b> 계산입니다 (주간 07~19시 12시간, 야간 19~07시 12시간 · 야간수당 22~06시). 연장근무·실제 급여와 다를 수 있어요.</p>
+    <p class="note">근무표 기준 <b>참고용</b> 계산입니다 (주간 07~19시 12시간, 야간 19~07시 12시간 · 야간수당 22~06시). 연장근무·실제 급여와 다를 수 있어요. 대근은 확정된 대근 + 쉬는 날 근무를 셉니다.</p>
 
     ${install}
     <section class="card">
@@ -1564,6 +1813,7 @@ async function fillInfo() {
     ${state.isOperator ? '<button class="btn primary block" data-action="operator">운영자 메뉴 (전체 팀 · 관리자 초대)</button>' : ''}
     <button class="btn ghost block" data-action="custom-types">내 근무 타입 관리 (커스텀)</button>
     ${isAdmin() ? '<button class="btn ghost block" data-action="team-settings">팀 설정 (공장·반·근무 기준)</button>' : ''}
+    <button class="btn ghost block" data-action="logout-others">다른 기기 모두 로그아웃</button>
     <div class="row-btns"><button class="btn ghost" data-action="logout">로그아웃</button>
       <button class="btn danger-ghost" data-action="leave">팀 나가기</button></div>
     <p class="muted center small-note">교대달력 · 광고 없음</p>`;
@@ -1619,6 +1869,10 @@ function openTeamSettingsSheet() {
       ${banField(state.team.ban_name)}
       <label>근무 기준 보정 <small class="muted">평소엔 바꿀 필요 없음 · 오늘 A조 근무</small><select name="apos">${posOptions(curPos)}</select></label>
       <p class="note preview">${previewFor({ anchor_date: t, a_pos: curPos })}</p>
+      <label>조별 정원 <small class="muted">비워 두면 인원부족 표시 안 함</small>
+        <input type="number" name="crew" min="1" max="30" inputmode="numeric" value="${state.team.crew_size ?? ''}" placeholder="예: 8"></label>
+      <p class="note">지금 앱 가입 인원: ${S.JOS.map((j) => `${j}조 ${shiftMembers().filter((mm) => curJo(mm) === j).length}명`).join(' · ')}<br>
+        <b>조원이 모두 가입한 뒤에</b> 켜 주세요. 가입 안 한 사람은 빈자리로 계산돼요.</p>
       <div class="row-btns"><button type="button" class="btn ghost" data-newcode>초대 코드 새로 만들기</button></div>
       <div class="row-btns"><button type="button" class="btn ghost" data-close>취소</button><button class="btn primary">저장</button></div>
     </form>`, { type: 'settings' });
@@ -1651,6 +1905,11 @@ function openTeamSettingsSheet() {
           p_factory: f.get('factory'), p_ban: ban, p_anchor: t, p_a_pos: +f.get('apos'),
         });
         if (error) throw error;
+        const crew = f.get('crew') ? +f.get('crew') : null;
+        if (crew !== (state.team.crew_size ?? null)) {
+          const r = await sb.rpc('set_crew_size', { p_size: crew });
+          if (r.error) throw r.error;
+        }
         closeSheet();
         await refresh({ team: true });
         toast('팀 설정을 저장했어요');
@@ -1880,13 +2139,19 @@ async function claimFamily(link) {
       <p>화면의 <b>⋮(또는 ⋯) 메뉴</b> → <b>${isIOS ? 'Safari로 열기' : '다른 브라우저로 열기'}</b>를 눌러 주세요. 그 브라우저에서 연결됩니다.</p></div>`, true);
     return;
   }
+  $app.innerHTML = authShell(`<h3 class="step">가족 근무 달력</h3>
+    <div class="card form"><p>가족이 보낸 <b>보기 전용</b> 근무 달력이에요. 로그인은 필요 없어요.</p>
+      <p class="note">이 링크는 <b>한 번만</b> 연결돼요. 앞으로 이 폰에서 볼 거라면 아래 버튼을 눌러 주세요.</p>
+      <button class="btn primary block" data-claim>이 기기에서 달력 보기</button></div>`, true);
+  await new Promise((resolve) => { $app.querySelector('[data-claim]').onclick = resolve; });
+  $app.innerHTML = '<div class="center-screen"><div class="spinner"></div></div>';
   try {
     const { data, error } = await sb.rpc('claim_family_link', { p_token: link, p_label: deviceLabel() });
     if (error) throw error;
     setFamilyToken(data.viewer_token);
     history.replaceState(null, '', `${location.pathname}?fv=${data.viewer_token}`);
     await renderFamily();
-    toast(`${data.name}님 근무 달력에 연결됐어요. 홈 화면에 추가해 두면 편해요`, null, 6000);
+    toast(`${data.name}님 근무 달력에 연결됐어요. ${/iphone|ipad/i.test(navigator.userAgent) ? '이 화면에서 공유 → 홈 화면에 추가' : '홈 화면에 추가'}해 두면 편해요`, null, 8000);
   } catch (e) {
     $app.innerHTML = authShell(`<h3 class="step">연결할 수 없어요</h3>
       <p class="note warn">${esc(translateErr(e.message || String(e)))}</p>
@@ -1963,8 +2228,7 @@ function drawFamily() {
   $app.innerHTML = `<main class="view family">
     <header class="top"><div><h1>${esc(d.name)}님 <small>근무 달력</small></h1>
       <p class="muted">가족 보기 · ${esc(d.factory)} ${esc(d.ban)}반</p></div><span class="live">● 자동 갱신</span></header>
-    ${!isStandalone() && !installDismissed() ? `<div class="install-banner"><span>📲 홈 화면에 추가하면 앱처럼 바로 열 수 있어요</span>
-      <button class="chip-btn" data-action="install-guide">방법 보기</button><button class="x-btn" data-action="install-dismiss" aria-label="닫기">✕</button></div>` : ''}
+    ${installBanner()}
     <section class="today-card">${card(`오늘 ${S.formatDay(wd)}`, wd)}${card('내일', S.addDays(wd, 1))}</section>
     ${monthNav(fam.ym, 'fmonth')}
     ${WEEK_HEAD}
@@ -2010,6 +2274,8 @@ async function loadFamilyList() {
 }
 
 async function familyAction(act, id) {
+  // 확인 창은 로딩 막 밖에서 먼저 (안에서 열면 로딩 막에 가려 멈춘 것처럼 보임)
+  if (act === 'family-revoke' && !(await confirmModal('이 기기의 연결을 끊을까요? 그 기기에서는 더 이상 내 달력을 볼 수 없어요.', '끊기'))) return;
   await withBusy(async () => {
     try {
       if (act === 'family-link') {
@@ -2022,7 +2288,6 @@ async function familyAction(act, id) {
           else { await navigator.clipboard.writeText(text); toast('가족 공유 링크를 복사했어요'); }
         } catch (e) { if (e?.name !== 'AbortError') { toast('공유하지 못했어요. 링크를 다시 만들어 주세요'); } }
       } else if (act === 'family-revoke') {
-        if (!(await confirmModal('이 기기의 연결을 끊을까요? 그 기기에서는 더 이상 내 달력을 볼 수 없어요.', '끊기'))) return;
         const { error } = await sb.rpc('revoke_family_viewer', { p_id: id });
         if (error) throw error;
         toast('연결을 끊었어요');
@@ -2040,6 +2305,21 @@ async function familyAction(act, id) {
 function isStandalone() {
   return window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 }
+const isSamsung = () => /SamsungBrowser/i.test(navigator.userAgent);
+/** 지금 주소 그대로 크롬에서 열기 (크롬이 없으면 Play 스토어로 이동) */
+function chromeIntentUrl() {
+  const u = new URL(location.href);
+  return `intent://${u.host}${u.pathname}${u.search}#Intent;scheme=https;package=com.android.chrome;end`;
+}
+function installBanner() {
+  if (isStandalone() || installDismissed()) return '';
+  if (isSamsung()) {
+    return `<div class="install-banner"><span>📲 삼성 인터넷에선 홈 화면 추가가 잘 안 돼요. 크롬에서 추가해 주세요</span>
+      <a class="chip-btn" href="${chromeIntentUrl()}">크롬으로 열기</a><button class="x-btn" data-action="install-dismiss" aria-label="닫기">✕</button></div>`;
+  }
+  return `<div class="install-banner"><span>📲 홈 화면에 추가하면 앱처럼 바로 열 수 있어요</span>
+      <button class="chip-btn" data-action="install-guide">방법 보기</button><button class="x-btn" data-action="install-dismiss" aria-label="닫기">✕</button></div>`;
+}
 function installGuide() {
   const ua = navigator.userAgent;
   const isIOS = /iphone|ipad|ipod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -2056,7 +2336,11 @@ function installGuide() {
       ? '<p>주소창 오른쪽 <b>공유 버튼</b> → <b>홈 화면에 추가</b>를 누르세요.</p>'
       : '<p>Safari 아래쪽 <b>공유 버튼(□↑)</b> → 아래로 내려서 <b>홈 화면에 추가</b>를 누르세요.</p>';
   }
-  if (/SamsungBrowser/i.test(ua)) return '<p>아래쪽 <b>≡ 메뉴</b> → <b>현재 페이지 추가</b> → <b>홈 화면</b>을 누르세요.</p>';
+  if (isSamsung()) {
+    return `<p class="note warn">삼성 인터넷은 홈 화면 추가가 잘 안 될 수 있어요. <b>크롬에서 열어서</b> 추가해 주세요.</p>
+      <a class="btn primary block" href="${chromeIntentUrl()}">크롬으로 열기</a>
+      <p class="muted small-note">크롬에서는 직번으로 한 번 더 로그인해야 해요. 크롬에서 ⋮ 메뉴 → <b>홈 화면에 추가</b>(또는 앱 설치).</p>`;
+  }
   return '<p>Chrome 오른쪽 위 <b>⋮ 메뉴</b> → <b>홈 화면에 추가</b> (또는 <b>앱 설치</b>)를 누르세요.</p>';
 }
 
@@ -2066,5 +2350,9 @@ function registerSW() {
     navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW 등록 실패', e));
   }
 }
+
+// 아이폰 Safari는 user-scalable=no 를 무시 → 두 손가락 확대 제스처를 직접 막음
+['gesturestart', 'gesturechange'].forEach((t) => document.addEventListener(t, (e) => e.preventDefault(), { passive: false }));
+document.addEventListener('touchmove', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
 
 boot();
