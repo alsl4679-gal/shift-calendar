@@ -66,7 +66,7 @@ const crewSize = () => state.team?.crew_size || 0;
 /** 그날 주간·야간 실제 인원과 부족 수 (파트장 제외) */
 function staffing(iso) {
   const n = crewSize();
-  if (!n) return null;
+  if (!n || S.dayPeriodOn(state.team, iso)) return null;
   const c = { D: 0, N: 0 };
   for (const mem of shiftMembers()) { const k = shiftOf(mem, iso).shift; if (k === 'D' || k === 'N') c[k]++; }
   return { c, D: Math.max(0, n - c.D), N: Math.max(0, n - c.N) };
@@ -249,20 +249,21 @@ function renderFatal(e) {
 
 // ---------- 데이터 ----------
 async function loadTeam() {
-  const [t, ms, jh, ct] = await Promise.all([
+  const [t, ms, jh, ct, dp] = await Promise.all([
     sb.from('teams').select('*').eq('id', state.me.team_id).maybeSingle(),
     sb.from('members').select('*').eq('team_id', state.me.team_id).order('display_name'),
     sb.from('member_jo_history').select('user_id,jo,effective_from').eq('team_id', state.me.team_id).order('effective_from'),
     sb.from('custom_types').select('*').eq('user_id', state.user.id).order('sort').order('created_at'),
+    sb.from('team_events').select('id,title,start_date,end_date,off_weekends').eq('team_id', state.me.team_id).eq('all_day_shift', true).order('start_date'),
   ]);
-  for (const r of [t, ms, jh, ct]) if (r.error) throw r.error;
+  for (const r of [t, ms, jh, ct, dp]) if (r.error) throw r.error;
   state.customTypes = new Map(ct.data.map((c) => [c.id, c]));
   state.joHist = new Map();
   for (const h of jh.data) {
     if (!state.joHist.has(h.user_id)) state.joHist.set(h.user_id, []);
     state.joHist.get(h.user_id).push(h);
   }
-  state.team = t.data;
+  state.team = t.data ? { ...t.data, day_periods: dp.data || [] } : null;
   state.members = ms.data;
   state.memberMap = new Map(ms.data.map((m) => [m.user_id, m]));
   state.me = state.memberMap.get(state.user.id) || null;
@@ -357,7 +358,7 @@ function subscribe() {
   state.channel = ch;
 }
 function onRealtime(p) {
-  if (p.table === 'members' || p.table === 'member_jo_history') rtMembers = true;
+  if (p.table === 'members' || p.table === 'member_jo_history' || p.table === 'team_events') rtMembers = true;
   if (p.table === 'members' && p.eventType === 'INSERT' && p.new?.status === 'pending'
       && (isSuper() || (isAdmin() && p.new.jo && p.new.jo === curJo(state.me)))) rtPending = p.new;
   if (p.table === 'cover_requests' && p.eventType === 'UPDATE' && p.new?.status === 'filled' && p.new.filled_by === state.user.id
@@ -701,6 +702,24 @@ function renderOnboarding(mode = 'join') {
   };
 }
 
+// ---------- 달력 넘기기 (옆으로 밀기) ----------
+let slideDir = 0;
+const slideCls = () => (slideDir > 0 ? 'slide-next' : slideDir < 0 ? 'slide-prev' : '');
+let swipeStart = null;
+async function shiftMonth(d) {
+  slideDir = d;
+  try {
+    if (state.family) {
+      const dt = new Date(fam.ym.y, fam.ym.m + d, 1); fam.ym = { y: dt.getFullYear(), m: dt.getMonth() };
+      await loadFamily();
+    } else {
+      const dt = new Date(state.ym.y, state.ym.m + d, 1); state.ym = { y: dt.getFullYear(), m: dt.getMonth() };
+      await withBusy(loadMonth).catch(toastErr);
+      renderApp();
+    }
+  } finally { slideDir = 0; }
+}
+
 // ---------- 앱 화면 ----------
 function renderApp() {
   if (!state.team || !state.me) return;
@@ -716,6 +735,20 @@ function renderApp() {
     </nav>`;
   if (state.tab === 'info') fillInfo();
 }
+
+$app.addEventListener('touchstart', (e) => {
+  const onCal = e.target.closest('.grid') && (state.family || state.tab === 'mine' || state.tab === 'team');
+  swipeStart = onCal && e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() } : null;
+}, { passive: true });
+$app.addEventListener('touchend', (e) => {
+  if (!swipeStart || document.querySelector('.sheet-back')) { swipeStart = null; return; }
+  const t = e.changedTouches[0];
+  const dx = t.clientX - swipeStart.x; const dy = t.clientY - swipeStart.y; const dt = Date.now() - swipeStart.t;
+  swipeStart = null;
+  // 옆으로 충분히, 세로보다 확실히 길게, 빠르게 밀었을 때만
+  if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.5 || dt > 700) return;
+  shiftMonth(dx < 0 ? 1 : -1);
+}, { passive: true });
 
 $app.addEventListener('click', async (e) => {
   const tabBtn = e.target.closest('[data-tab]');
@@ -865,7 +898,7 @@ function viewMine() {
     <section class="today-card">${card(`오늘 ${S.formatDay(wd)}`, t0, wd)}${card('내일', t1, S.addDays(wd, 1))}</section>
     ${monthNav(state.ym, 'month')}
     ${WEEK_HEAD}
-    <div class="grid mine rows-${S.monthGrid(y, m).length / 7}">${cells}</div>`;
+    <div class="grid mine rows-${S.monthGrid(y, m).length / 7} ${slideCls()}">${cells}</div>`;
 }
 
 function openMineSheet(iso) {
@@ -1125,7 +1158,7 @@ function eventStrip(iso) {
 function eventsLine(iso) {
   const evs = eventsOn(iso);
   return evs.length ? `<div class="ev-lines">${evs.map((e) => `<div class="ev-line"><i style="background:${e.color}"></i>
-    <b>${esc(e.title)}</b> <span class="muted">${md(e.start_date)}${e.end_date !== e.start_date ? `~${md(e.end_date)}` : ''}</span>
+    <b>${esc(e.title)}</b>${state.team?.day_periods?.some((p) => p.id === e.id) ? ' <span class="tag allday">전원 주간</span>' : ''} <span class="muted">${md(e.start_date)}${e.end_date !== e.start_date ? `~${md(e.end_date)}` : ''}</span>
     ${e.note ? `<div class="muted small-note">${esc(e.note)}</div>` : ''}</div>`).join('')}</div>` : '';
 }
 
@@ -1143,8 +1176,8 @@ async function openEventsSheet(editId = null) {
     <h3>🏭 팀 일정</h3>
     <p class="muted small-note">대수리처럼 반 전체에 해당하는 일정이에요. 팀원 모두의 내 달력·팀 달력에 표시돼요.</p>
     ${list.length ? `<ul class="ctype-list">${list.map((e) => `<li>
-      <span class="ev-dot" style="background:${e.color}"></span><span><b>${esc(e.title)}</b>
-      <small class="muted">${md(e.start_date)}${e.end_date !== e.start_date ? `~${md(e.end_date)}` : ''}</small></span>
+      <span class="ev-dot" style="background:${e.color}"></span><span><b>${esc(e.title)}</b>${e.all_day_shift ? ' <span class="tag allday">전원 주간</span>' : ''}
+      <small class="muted">${md(e.start_date)}${e.end_date !== e.start_date ? `~${md(e.end_date)}` : ''}${e.all_day_shift && e.off_weekends ? ' · 주말·공휴일 휴무' : ''}</small></span>
       ${canSchedule() ? `<span class="ctype-actions"><button class="btn ghost sm" data-eedit="${e.id}">수정</button>
       <button class="btn danger-ghost sm" data-edel="${e.id}">삭제</button></span>` : ''}</li>`).join('')}</ul>` : '<p class="muted small-note">등록된 일정이 없어요.</p>'}
     ${canSchedule() ? `<form id="evf" class="form ctype-form">
@@ -1153,11 +1186,18 @@ async function openEventsSheet(editId = null) {
       <div class="two-col"><label>시작<input type="date" name="start" value="${editing?.start_date || t}" required></label>
         <label>끝<input type="date" name="end" value="${editing?.end_date || t}" required></label></div>
       <label>메모 <small class="muted">선택</small><input name="note" maxlength="300" value="${esc(editing?.note || '')}" placeholder="예: 공장 가동 중지, 설비 정비"></label>
+      <div class="allday-box">
+        <label class="check-row"><input type="checkbox" name="allday" ${editing?.all_day_shift ? 'checked' : ''}> <b>이 기간 4개조 전원 일시 주간</b></label>
+        <label class="check-row sub"><input type="checkbox" name="offwk" ${editing?.off_weekends ? 'checked' : ''} ${editing?.all_day_shift ? '' : 'disabled'}> 토·일·공휴일은 휴무</label>
+        <p class="muted small-note">켜면 이 기간 모두의 근무가 주간(07~19)으로 바뀌고, 휴가를 내도 대근 요청이 생기지 않아요.</p>
+      </div>
       ${colorField(color0)}
       <div class="row-btns"><button type="button" class="btn ghost" data-close>닫기</button><button class="btn primary">${editing ? '수정 저장' : '추가'}</button></div>
     </form>` : '<div class="row-btns"><button class="btn ghost block" data-close>닫기</button></div>'}`, { type: 'events' });
   sh.querySelector('[data-close]').onclick = closeSheet;
   wireColorPicker(sh);
+  const allday = sh.querySelector('input[name=allday]');
+  allday?.addEventListener('change', () => { const o = sh.querySelector('input[name=offwk]'); o.disabled = !allday.checked; if (!allday.checked) o.checked = false; });
   sh.querySelectorAll('[data-eedit]').forEach((b) => { b.onclick = () => openEventsSheet(b.dataset.eedit); });
   sh.querySelectorAll('[data-edel]').forEach((b) => {
     b.onclick = async () => {
@@ -1167,7 +1207,7 @@ async function openEventsSheet(editId = null) {
         try {
           const { error } = await sb.rpc('delete_team_event', { p_id: e.id });
           if (error) throw error;
-          await loadMonth(); renderApp(); await openEventsSheet();
+          await loadTeam(); await loadMonth(); renderApp(); await openEventsSheet();
           toast('일정을 삭제했어요');
         } catch (err) { toastErr(err); }
       });
@@ -1182,9 +1222,10 @@ async function openEventsSheet(editId = null) {
         const { error } = await sb.rpc('save_team_event', {
           p_id: editing?.id || null, p_title: f.get('title'), p_start: f.get('start'), p_end: f.get('end'),
           p_color: f.get('color'), p_note: f.get('note'),
+          p_all_day: f.get('allday') === 'on', p_off_weekends: f.get('allday') === 'on' && f.get('offwk') === 'on',
         });
         if (error) throw error;
-        await loadMonth(); renderApp(); await openEventsSheet();
+        await loadTeam(); await loadMonth(); renderApp(); await openEventsSheet();
         toast(editing ? '일정을 수정했어요' : '팀 일정을 추가했어요');
       } catch (err) { toastErr(err); }
     });
@@ -1494,7 +1535,9 @@ function viewTeam() {
     const dow = S.fromISO(iso).getDay();
     return `<button class="cell tcell ${iso === today ? 'today' : ''}" data-action="team-day" data-iso="${iso}">
       ${cellHead(iso, dow, mine.shift === 'D' || mine.shift === 'N' ? `<i class="me-dot s-${mine.shift}"></i>` : '')}
-      <span class="duty"><i class="d${st?.D ? ' short' : ''}"${st?.D ? ` data-s="-${st.D}"` : ''}>${duty.D.join('')}</i><i class="n${st?.N ? ' short' : ''}"${st?.N ? ` data-s="-${st.N}"` : ''}>${duty.N.join('')}</i></span>
+      ${S.dayPeriodOn(state.team, iso)
+        ? `<span class="duty all">${duty.D.length ? '<i class="d all">전원</i>' : '<i class="o all">휴무</i>'}</span>`
+        : `<span class="duty"><i class="d${st?.D ? ' short' : ''}"${st?.D ? ` data-s="-${st.D}"` : ''}>${duty.D.join('')}</i><i class="n${st?.N ? ' short' : ''}"${st?.N ? ` data-s="-${st.N}"` : ''}>${duty.N.join('')}</i></span>`}
       ${open ? `<span class="pill open">대근${open}</span>` : assigned ? `<span class="pill assigned">지정${assigned}</span>` : filled ? `<span class="pill filled">확정${filled}</span>` : ''}
       ${eventStrip(iso)}
     </button>`;
@@ -1516,8 +1559,9 @@ function viewTeam() {
       ${up ? `<div class="req-list">${up}</div>` : ''}</section>
     ${monthNav(state.ym, 'month')}
     ${WEEK_HEAD}
-    <div class="grid">${cells}</div>
+    <div class="grid team ${slideCls()}">${cells}</div>
     <p class="legend"><span class="duty inline"><i class="d">A</i></span>주간 조 <span class="duty inline"><i class="n">D</i></span>야간 조
+      ${state.team.day_periods.some((p) => p.start_date <= S.monthRange(y, m).end && p.end_date >= S.monthRange(y, m).start) ? '<span class="duty inline all"><i class="d all">전원</i></span>4개조 일시 주간' : ''}
       <span class="pill open">대근</span>필요 <span class="pill assigned">지정</span>확인 대기 <span class="pill filled">확정</span>완료 <i class="me-dot s-D inline"></i>내 근무
       ${crewSize() ? `<span class="duty inline"><i class="d short" data-s="-1">A</i></span>인원부족 (정원 ${crewSize()}명)` : ''}</p>`;
 }
@@ -1631,7 +1675,7 @@ function openTeamSheet(iso) {
   const duty = S.josOnDuty(state.team, iso);
 
   const sh = openSheet(`
-    <h3>${S.formatDay(iso)}${holidayTag(iso)} <small class="muted">주간 ${duty.D.join('')}조 · 야간 ${duty.N.join('')}조</small></h3>
+    <h3>${S.formatDay(iso)}${holidayTag(iso)} <small class="muted">${S.dayPeriodOn(state.team, iso) ? (duty.D.length ? '4개조 전원 일시 주간' : '전원 주간 기간 · 휴무일') : `주간 ${duty.D.join('')}조 · 야간 ${duty.N.join('')}조`}</small></h3>
     ${eventsLine(iso)}
     ${pollsLine(iso)}
     ${absReqs.length || otherVac.length ? `<section class="sec"><h4>자리 비움 · 대근</h4>
@@ -2205,7 +2249,7 @@ async function loadFamily() {
 function familyShift(iso) {
   const d = fam.data;
   const ov = d.overrides.find((o) => o.work_date === iso);
-  return S.effectiveShift({ anchor_date: d.anchor_date, a_pos: d.a_pos }, S.joOn(d.jo_history, iso), iso, ov);
+  return S.effectiveShift({ anchor_date: d.anchor_date, a_pos: d.a_pos, day_periods: d.day_periods || [] }, S.joOn(d.jo_history, iso), iso, ov);
 }
 
 function drawFamily() {
@@ -2232,7 +2276,7 @@ function drawFamily() {
     <section class="today-card">${card(`오늘 ${S.formatDay(wd)}`, wd)}${card('내일', S.addDays(wd, 1))}</section>
     ${monthNav(fam.ym, 'fmonth')}
     ${WEEK_HEAD}
-    <div class="grid mine rows-${grid.length / 7}">${cells}</div>
+    <div class="grid mine rows-${grid.length / 7} ${slideCls()}">${cells}</div>
     <p class="muted center small-note">마지막 업데이트 ${hhmm} · 열어 두면 1분마다 새로고침
       <br><button class="link-btn" data-action="family-unlink">이 기기 연결 해제</button></p>
   </main>`;

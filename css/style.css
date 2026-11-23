@@ -574,3 +574,18 @@ a.btn { display: flex; align-items: center; justify-content: center; text-decora
 .vol-tag { background: #dcfce7; color: #166534; }
 .warn-tag { background: #fff7ed; color: #c2410c; }
 .fam-hint { margin-top: 16px; font-size: 13px; }
+
+/* 달력 넘기기 효과 */
+@keyframes slideNext { from { transform: translateX(28px); opacity: .35; } to { transform: none; opacity: 1; } }
+@keyframes slidePrev { from { transform: translateX(-28px); opacity: .35; } to { transform: none; opacity: 1; } }
+.grid.slide-next { animation: slideNext .2s ease-out; }
+.grid.slide-prev { animation: slidePrev .2s ease-out; }
+.grid { touch-action: pan-y; }
+
+/* 4개조 전원 일시 주간 */
+.duty i.all { width: auto; min-width: 0; padding: 0 5px; font-size: 10px; letter-spacing: -0.3px; }
+.duty i.o.all { background: #f1f3f5; color: #e03131; }
+.tag.allday { background: #fff4d6; color: #a15c00; }
+.allday-box { background: #fffbeb; border: 1px solid #fde68a; border-radius: 12px; padding: 8px 10px; display: flex; flex-direction: column; gap: 4px; }
+.check-row.sub { padding-left: 26px; font-size: 13px; }
+.check-row input:disabled + * , .check-row.sub:has(input:disabled) { opacity: .5; }

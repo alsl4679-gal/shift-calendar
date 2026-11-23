@@ -1,5 +1,7 @@
 // 근무 계산 로직 (화면과 분리 — 나중에 Dart로 옮기기 쉽게)
 
+import { HOLIDAYS } from './holidays.js';
+
 // 8일 주기: 주주휴휴야야휴휴
 export const PATTERN = ['D', 'D', 'O', 'O', 'N', 'N', 'O', 'O'];
 
@@ -58,7 +60,16 @@ export function daysBetween(aIso, bIso) {
 const mod = (n, m) => ((n % m) + m) % m;
 
 /** 기본 근무 (패턴만으로 계산) */
+/** 대수리 등 '4개조 전원 일시 주간' 기간 (팀 일정에서 지정) */
+export function dayPeriodOn(team, iso) {
+  return (team?.day_periods || []).find((p) => p.start_date <= iso && iso <= p.end_date) || null;
+}
 export function baseShift(team, jo, iso) {
+  const p = jo ? dayPeriodOn(team, iso) : null;
+  if (p) {
+    const dow = fromISO(iso).getDay();
+    return p.off_weekends && (dow === 0 || dow === 6 || HOLIDAYS[iso]) ? 'O' : 'D';
+  }
   const pos = mod(team.a_pos + JO_OFFSET[jo] + daysBetween(team.anchor_date, iso), 8);
   return PATTERN[pos];
 }
