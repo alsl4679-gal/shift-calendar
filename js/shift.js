@@ -13,8 +13,8 @@ export const FIXED_TYPES = ['D', 'N', 'O', 'V', 'E', 'H', 'T', 'R'];
 // 자리 비움: 근무일에 걸리면 팀에 '대근 필요'
 export const ABSENCE = new Set(['V', 'E', 'H', 'T', 'R']);
 export const SHIFT_INFO = {
-  D: { label: '주간', short: '주', time: '07:00~17:00', hours: 10, nightHours: 0 },
-  N: { label: '야간', short: '야', time: '17:00~07:00', hours: 14, nightHours: 8 },
+  D: { label: '주간', short: '주', time: '07:00~19:00', hours: 12, nightHours: 0 },
+  N: { label: '야간', short: '야', time: '19:00~07:00', hours: 12, nightHours: 8 }, // 22~06시 = 야간수당 8시간
   O: { label: '휴무', short: '휴', time: '', hours: 0, nightHours: 0 },
   V: { label: '휴가', short: '휴가', time: '', hours: 0, nightHours: 0 },
   E: { label: '교육', short: '교육', time: '', hours: 0, nightHours: 0 },

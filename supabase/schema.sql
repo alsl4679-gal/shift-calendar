@@ -1,6 +1,6 @@
 -- 교대달력 DB 구조 (Supabase 프로젝트 shift-calendar 에 이미 적용됨)
 -- 새 프로젝트에 다시 만들 때만 SQL Editor에서 실행하세요.
--- 적용 이력: init_shift_schema, lock_internal_functions, invite_code_check, jo_history, work_types, custom_type_auto, team_create_code_and_transfer, member_approval, operator_and_admin_invite (위에서 아래 순서대로 실행)
+-- 적용 이력: init_shift_schema, lock_internal_functions, invite_code_check, jo_history, work_types, custom_type_auto, team_create_code_and_transfer, member_approval, operator_and_admin_invite, family_share, team_events, team_polls, part_leader_and_jo_scope (위에서 아래 순서대로 실행)
 -- work_types 는 Supabase 대시보드 Database > Migrations 의 'work_types' 항목과 같습니다 (대시보드 Database > Migrations 에서도 확인 가능)
 
 -- ===== Tables =====
@@ -637,3 +637,12 @@ alter publication supabase_realtime add table public.member_jo_history;
 -- member_approval: members.status(pending/active), my_team_id()는 active만, my_any_team_id(), approve_member(), 승인 대기자는 _me()에서 차단
 -- operator_and_admin_invite: app_operators(통합 운영자), is_operator(), teams.admin_invite_code(1회용), op_teams()/op_create_team()/op_new_admin_code(), 운영자 보호
 --   운영자 추가: insert into public.app_operators (user_id) select id from auth.users where email = '직번@iamwciscebbqhsuauitz.supabase.co';
+-- family_share: family_links(1회용 링크), family_viewers(해시 토큰), create_family_link()/claim_family_link()/family_view()/list_family_viewers()/revoke_family_viewer()/cancel_family_links()
+-- team_events: members.can_schedule, team_events 테이블(팀원 읽기), save_team_event()/delete_team_event()/set_schedule_permission()
+
+-- team_polls: polls(제목·항목 2~6·여러개 선택·대상 조·날짜·마감일·마감 여부), poll_votes(poll_id,user_id,option_idx)
+--   팀원 읽기 RLS, 쓰기는 save_poll()/vote_poll()/close_poll()/delete_poll() — 만든 사람·관리자·운영자만 수정/마감/삭제
+--   투표 후 항목 잠금, 대상 조 아닌 사람·마감 후 투표 차단, 팀 나가면 표 삭제(트리거), realtime 등록
+-- part_leader_and_jo_scope: members.is_part(파트장), _is_super()=파트장|운영자, _jo_now()
+--   approve_member/remove_member: 주임은 자기 조만, 파트장·운영자는 전체 / set_member_jo(타인): 파트장·운영자만
+--   set_member_role: 파트장 권한은 운영자만 변경 / transfer_admin: 파트장은 불가 / set_part_leader(): 운영자만
