@@ -1,6 +1,6 @@
 // 앱 화면 파일만 캐시 (Supabase 데이터는 캐시하지 않음 — 항상 최신)
 // 네트워크 우선이라 온라인이면 항상 최신 파일을 받습니다. 캐시 정리가 필요하면 VERSION을 올리세요.
-const VERSION = 'v11';
+const VERSION = 'v12';
 const CACHE = `shift-calendar-${VERSION}`;
 const ASSETS = [
   './',

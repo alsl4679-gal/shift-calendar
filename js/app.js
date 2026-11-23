@@ -39,6 +39,7 @@ function cellHead(iso, dow) {
   return `<span class="cell-head"><span class="dnum ${h || dow === 0 ? 'sun' : dow === 6 ? 'sat' : ''}">${+iso.slice(8)}</span>${
     h ? `<span class="hname">${h}</span>` : ''}</span>`;
 }
+const installDismissed = () => { try { return localStorage.getItem('installDismissed') === '1'; } catch { return false; } };
 const holidayTag = (iso) => (HOLIDAYS[iso] ? ` <span class="holiday-tag">${HOLIDAYS[iso]}</span>` : '');
 function shiftOf(member, iso) {
   const jo = joAt(member.user_id, iso);
@@ -655,6 +656,14 @@ $app.addEventListener('click', async (e) => {
   else if (act === 'team-settings') openTeamSettingsSheet();
   else if (act === 'member') openMemberSheet(a.dataset.uid);
   else if (act === 'install') installApp();
+  else if (act === 'install-guide') {
+    if (state.installPrompt) installApp();
+    else openSheet(`<h3>📲 홈 화면에 앱 추가</h3>${installGuide()}<div class="row-btns"><button class="btn ghost block" data-close>닫기</button></div>`, { type: 'install' })
+      .querySelector('[data-close]').onclick = closeSheet;
+  } else if (act === 'install-dismiss') {
+    try { localStorage.setItem('installDismissed', '1'); } catch { /* 무시 */ }
+    renderApp();
+  }
   else if (act === 'logout') { if (await confirmModal('로그아웃할까요?', '로그아웃')) sb.auth.signOut(); }
   else if (act === 'leave') leaveTeam();
 });
@@ -682,6 +691,8 @@ function viewMine() {
       <span class="t-time">${s.shift ? (S.SHIFT_INFO[s.shift].time || (S.ABSENCE.has(s.shift) ? S.SHIFT_INFO[s.shift].label : '쉬는 날')) : ''}</span></div>`;
   return `<header class="top"><div><h1>${esc(state.me.display_name)} <small>${joLabel(curJo(state.me))}</small></h1>
       <p class="muted">${esc(state.team.factory_name)} · ${esc(state.team.ban_name)}반</p></div></header>
+    ${!isStandalone() && !installDismissed() ? `<div class="install-banner"><span>📲 홈 화면에 추가하면 앱처럼 바로 열 수 있어요</span>
+      <button class="chip-btn" data-action="install-guide">방법 보기</button><button class="x-btn" data-action="install-dismiss" aria-label="닫기">✕</button></div>` : ''}
     <section class="today-card">${card(`오늘 ${S.formatDay(wd)}`, t0, wd)}${card('내일', t1, S.addDays(wd, 1))}</section>
     ${monthNav(state.ym, 'month')}
     ${WEEK_HEAD}
@@ -1039,11 +1050,7 @@ async function fillInfo() {
       ${esc(mm.display_name)}${mm.role === 'admin' ? '<em>관리자</em>' : ''}</button>`).join('')}</div>`;
   }).join('');
 
-  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
-  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
-  const install = standalone ? '' : state.installPrompt
-    ? '<button class="btn ghost block" data-action="install">홈 화면에 앱 설치</button>'
-    : isIOS ? '<p class="note">홈 화면에 추가하려면 Safari 하단 <b>공유</b> 버튼 → <b>홈 화면에 추가</b>를 누르세요.</p>' : '';
+  const install = isStandalone() ? '' : `<section class="card install-card" id="install"><h4>📲 홈 화면에 앱 추가</h4>${installGuide()}</section>`;
 
   root.innerHTML = `
     <header class="top"><div><h1>${esc(state.me.display_name)} <small>${joLabel(curJo(state.me))}</small></h1>
@@ -1064,6 +1071,7 @@ async function fillInfo() {
     </div>
     <p class="note">근무표 기준 <b>참고용</b> 계산입니다 (주간 10시간, 야간 14시간). 연장근무·실제 급여와 다를 수 있어요.</p>
 
+    ${install}
     <section class="card">
       <h4>팀 초대 코드</h4>
       <div class="code-row"><code class="invite">${esc(state.team.invite_code)}</code>
@@ -1081,7 +1089,6 @@ async function fillInfo() {
     ${state.isOperator ? '<button class="btn primary block" data-action="operator">운영자 메뉴 (전체 팀 · 관리자 초대)</button>' : ''}
     <button class="btn ghost block" data-action="custom-types">내 근무 타입 관리 (커스텀)</button>
     ${isAdmin() ? '<button class="btn ghost block" data-action="team-settings">팀 설정 (공장·반·근무 기준)</button>' : ''}
-    ${install}
     <div class="row-btns"><button class="btn ghost" data-action="logout">로그아웃</button>
       <button class="btn danger-ghost" data-action="leave">팀 나가기</button></div>
     <p class="muted center small-note">교대달력 · 광고 없음</p>`;
@@ -1350,6 +1357,30 @@ async function leaveTeam() {
       toast('팀에서 나왔어요');
     } catch (e) { toastErr(e); }
   });
+}
+
+// ---------- 홈 화면 추가 안내 ----------
+function isStandalone() {
+  return window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+}
+function installGuide() {
+  const ua = navigator.userAgent;
+  const isIOS = /iphone|ipad|ipod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (/KAKAOTALK/i.test(ua)) {
+    return `<p class="note warn">카카오톡 안에서는 앱으로 추가할 수 없어요. 화면의 <b>⋮(또는 ⋯) 메뉴</b> →
+      <b>${isIOS ? 'Safari로 열기' : '다른 브라우저로 열기'}</b>를 누른 뒤, 거기서 다시 추가해 주세요.</p>`;
+  }
+  if (/NAVER\(inapp|Instagram|FBAN|FBAV|Line\//i.test(ua)) {
+    return '<p class="note warn">앱 안의 브라우저에서는 추가할 수 없어요. 메뉴에서 <b>다른 브라우저로 열기</b>를 눌러 주세요.</p>';
+  }
+  if (state.installPrompt) return '<button class="btn primary block" data-action="install">홈 화면에 설치</button>';
+  if (isIOS) {
+    return /CriOS/i.test(ua)
+      ? '<p>주소창 오른쪽 <b>공유 버튼</b> → <b>홈 화면에 추가</b>를 누르세요.</p>'
+      : '<p>Safari 아래쪽 <b>공유 버튼(□↑)</b> → 아래로 내려서 <b>홈 화면에 추가</b>를 누르세요.</p>';
+  }
+  if (/SamsungBrowser/i.test(ua)) return '<p>아래쪽 <b>≡ 메뉴</b> → <b>현재 페이지 추가</b> → <b>홈 화면</b>을 누르세요.</p>';
+  return '<p>Chrome 오른쪽 위 <b>⋮ 메뉴</b> → <b>홈 화면에 추가</b> (또는 <b>앱 설치</b>)를 누르세요.</p>';
 }
 
 // ---------- PWA ----------

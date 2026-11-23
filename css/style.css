@@ -336,3 +336,9 @@ body.busy .busy-overlay { display: flex; }
 .op-codes code { font-family: ui-monospace, Menlo, monospace; font-weight: 800; letter-spacing: 1px; background: #edf2f7; border-radius: 6px; padding: 1px 6px; }
 .op-codes code.admin { background: #fff3bf; color: #7c5e00; }
 .op-team .row-btns { margin-top: 8px; }
+
+/* 홈 화면 추가 안내 */
+.install-banner { display: flex; align-items: center; gap: 8px; background: #eef4ff; color: #1e3a8a; border-radius: 12px; padding: 8px 10px; margin-bottom: 8px; font-size: 13px; }
+.install-banner span { flex: 1; }
+.x-btn { width: 28px; height: 28px; border-radius: 14px; color: #64748b; }
+.install-card p { margin: 4px 0 0; font-size: 14px; }
