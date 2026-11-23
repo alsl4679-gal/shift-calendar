@@ -1,6 +1,7 @@
 -- 교대달력 DB 구조 (Supabase 프로젝트 shift-calendar 에 이미 적용됨)
 -- 새 프로젝트에 다시 만들 때만 SQL Editor에서 실행하세요.
--- 적용 이력: init_shift_schema, lock_internal_functions (대시보드 Database > Migrations 에서도 확인 가능)
+-- 적용 이력: init_shift_schema, lock_internal_functions, invite_code_check, jo_history, work_types, custom_type_auto (위에서 아래 순서대로 실행)
+-- work_types 는 Supabase 대시보드 Database > Migrations 의 'work_types' 항목과 같습니다 (대시보드 Database > Migrations 에서도 확인 가능)
 
 -- ===== Tables =====
 create table public.teams (
@@ -408,3 +409,224 @@ from authenticated, anon, public;
 -- ===== Realtime =====
 alter publication supabase_realtime add table
   public.members, public.cover_requests, public.day_overrides, public.cover_volunteers;
+
+-- ===== 가입 전 초대 코드 확인 (invite_code_check) =====
+create or replace function public.check_invite_code(p_code text) returns json
+language sql stable security definer set search_path = public as $$
+  select json_build_object('factory', factory_name, 'ban', ban_name)
+  from public.teams where invite_code = upper(trim(p_code))
+$$;
+revoke execute on function public.check_invite_code(text) from public;
+grant execute on function public.check_invite_code(text) to anon, authenticated;
+
+-- ===== 조 변경 이력 (jo_history): 조는 가입 후 설정, 인사이동은 "언제부터"로 =====
+alter table public.members alter column jo drop not null;
+
+create table public.member_jo_history (
+  user_id uuid not null references public.members(user_id) on delete cascade,
+  team_id uuid not null references public.teams(id) on delete cascade,
+  jo text not null check (jo in ('A','B','C','D')),
+  effective_from date not null,
+  created_at timestamptz not null default now(),
+  primary key (user_id, effective_from)
+);
+create index member_jo_history_team_idx on public.member_jo_history(team_id);
+alter table public.member_jo_history enable row level security;
+create policy jo_history_select on public.member_jo_history for select to authenticated using (team_id = public.my_team_id());
+revoke insert, update, delete on public.member_jo_history from anon, authenticated;
+
+create or replace function public.jo_on(p_user uuid, p_date date) returns text
+language sql stable security definer set search_path = public as $$
+  select coalesce(
+    (select h.jo from public.member_jo_history h where h.user_id = p_user and h.effective_from <= p_date order by h.effective_from desc limit 1),
+    (select h.jo from public.member_jo_history h where h.user_id = p_user order by h.effective_from asc limit 1))
+$$;
+
+create or replace function public.effective_shift(p_user uuid, p_date date) returns text
+language sql stable security definer set search_path = public as $$
+  select coalesce(
+    (select o.shift from public.day_overrides o where o.user_id = p_user and o.work_date = p_date),
+    (select public.base_shift(m.team_id, public.jo_on(p_user, p_date), p_date) from public.members m where m.user_id = p_user))
+$$;
+
+create or replace function public.create_team(
+  p_factory text, p_ban text, p_display_name text, p_jo text, p_anchor date, p_a_pos int
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare v_team uuid;
+begin
+  if auth.uid() is null then raise exception '로그인이 필요합니다'; end if;
+  if exists (select 1 from public.members where user_id = auth.uid()) then raise exception '이미 팀에 소속되어 있습니다'; end if;
+  insert into public.teams (factory_name, ban_name, invite_code, anchor_date, a_pos, created_by)
+  values (trim(p_factory), trim(p_ban), public._gen_invite_code(), p_anchor, p_a_pos, auth.uid()) returning id into v_team;
+  insert into public.members (user_id, team_id, display_name, jo, role) values (auth.uid(), v_team, trim(p_display_name), p_jo, 'admin');
+  if p_jo is not null then
+    insert into public.member_jo_history (user_id, team_id, jo, effective_from) values (auth.uid(), v_team, p_jo, date '2000-01-01');
+  end if;
+  return v_team;
+end $$;
+
+create or replace function public.join_team(p_code text, p_display_name text, p_jo text) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare v_team uuid;
+begin
+  if auth.uid() is null then raise exception '로그인이 필요합니다'; end if;
+  if exists (select 1 from public.members where user_id = auth.uid()) then raise exception '이미 팀에 소속되어 있습니다'; end if;
+  select id into v_team from public.teams where invite_code = upper(trim(p_code));
+  if v_team is null then raise exception '초대 코드를 찾을 수 없습니다'; end if;
+  insert into public.members (user_id, team_id, display_name, jo, role) values (auth.uid(), v_team, trim(p_display_name), p_jo, 'member');
+  if p_jo is not null then
+    insert into public.member_jo_history (user_id, team_id, jo, effective_from) values (auth.uid(), v_team, p_jo, date '2000-01-01');
+  end if;
+  return v_team;
+end $$;
+
+drop function public.update_my_profile(text, text);
+create function public.update_my_profile(p_display_name text) returns void
+language plpgsql security definer set search_path = public as $$
+declare m public.members := public._me();
+begin
+  update public.members set display_name = trim(p_display_name) where user_id = m.user_id;
+end $$;
+
+create or replace function public.set_member_jo(p_user uuid, p_jo text, p_from date) returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  m public.members := public._me();
+  v_target uuid := coalesce(p_user, m.user_id);
+  t public.members;
+  r record;
+  rq public.cover_requests;
+  v_base text;
+begin
+  if p_jo is null or p_jo not in ('A','B','C','D') then raise exception '잘못된 조입니다'; end if;
+  select * into t from public.members where user_id = v_target and team_id = m.team_id;
+  if t.user_id is null then raise exception '같은 팀 멤버가 아닙니다'; end if;
+  if v_target <> m.user_id and m.role <> 'admin' then raise exception '다른 사람의 조는 관리자만 바꿀 수 있습니다'; end if;
+
+  if not exists (select 1 from public.member_jo_history where user_id = v_target) then
+    insert into public.member_jo_history (user_id, team_id, jo, effective_from) values (v_target, t.team_id, p_jo, date '2000-01-01');
+    update public.members set jo = p_jo where user_id = v_target;
+    return;
+  end if;
+  if p_from is null then raise exception '적용 시작일을 정해 주세요'; end if;
+
+  delete from public.member_jo_history where user_id = v_target and effective_from >= p_from;
+  insert into public.member_jo_history (user_id, team_id, jo, effective_from) values (v_target, t.team_id, p_jo, p_from);
+  update public.members set jo = public.jo_on(v_target, current_date) where user_id = v_target;
+
+  for r in select o.id, o.work_date, o.cover_request_id from public.day_overrides o
+            where o.user_id = v_target and o.is_cover and o.work_date >= p_from loop
+    if public.base_shift(t.team_id, public.jo_on(v_target, r.work_date), r.work_date) in ('D','N') then
+      update public.cover_requests set status = 'open', filled_by = null, updated_at = now() where id = r.cover_request_id and status = 'filled';
+      delete from public.cover_volunteers where request_id = r.cover_request_id and user_id = v_target;
+      delete from public.day_overrides where id = r.id;
+    end if;
+  end loop;
+
+  delete from public.day_overrides o
+   where o.user_id = v_target and not o.is_cover and o.work_date >= p_from
+     and o.shift = public.base_shift(t.team_id, public.jo_on(v_target, o.work_date), o.work_date);
+
+  for r in select o.work_date from public.day_overrides o where o.user_id = v_target and o.shift = 'V' and o.work_date >= p_from loop
+    v_base := public.base_shift(t.team_id, public.jo_on(v_target, r.work_date), r.work_date);
+    if v_base in ('D','N') then
+      select * into rq from public.cover_requests where requester_id = v_target and work_date = r.work_date;
+      if rq.id is null then
+        insert into public.cover_requests (team_id, requester_id, work_date, shift) values (t.team_id, v_target, r.work_date, v_base);
+      elsif rq.status = 'cancelled' then
+        update public.cover_requests set status = 'open', shift = v_base, filled_by = null, created_at = now(), updated_at = now() where id = rq.id;
+      end if;
+    end if;
+  end loop;
+
+  for rq in select * from public.cover_requests where requester_id = v_target and work_date >= p_from and status in ('open','filled') loop
+    v_base := public.base_shift(t.team_id, public.jo_on(v_target, rq.work_date), rq.work_date);
+    if v_base not in ('D','N')
+       or not exists (select 1 from public.day_overrides where user_id = v_target and work_date = rq.work_date and shift = 'V') then
+      perform public._cancel_request(rq.id);
+    elsif v_base <> rq.shift then
+      update public.cover_requests set shift = v_base, updated_at = now() where id = rq.id;
+      update public.day_overrides set shift = v_base, updated_at = now() where cover_request_id = rq.id and is_cover;
+    end if;
+  end loop;
+end $$;
+
+create or replace function public.set_my_shift(p_date date, p_shift text) returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  m public.members := public._me();
+  v_jo text; v_base text; v_prev public.day_overrides; v_new_eff text; v_req public.cover_requests;
+begin
+  if p_shift is not null and p_shift not in ('D','N','O','V') then raise exception '잘못된 근무 형태입니다'; end if;
+  v_jo := public.jo_on(m.user_id, p_date);
+  if v_jo is null then raise exception '먼저 내 조를 설정해 주세요'; end if;
+  v_base := public.base_shift(m.team_id, v_jo, p_date);
+  select * into v_prev from public.day_overrides where user_id = m.user_id and work_date = p_date;
+  if v_prev.id is not null and v_prev.is_cover then
+    if p_shift = v_prev.shift then return; end if;
+    update public.cover_requests set status = 'open', filled_by = null, updated_at = now() where id = v_prev.cover_request_id and status = 'filled';
+    delete from public.cover_volunteers where request_id = v_prev.cover_request_id and user_id = m.user_id;
+    delete from public.day_overrides where id = v_prev.id;
+  end if;
+  if p_shift is null or p_shift = v_base then
+    delete from public.day_overrides where user_id = m.user_id and work_date = p_date;
+  else
+    insert into public.day_overrides (team_id, user_id, work_date, shift, is_cover, cover_request_id, updated_at)
+    values (m.team_id, m.user_id, p_date, p_shift, false, null, now())
+    on conflict (user_id, work_date) do update set shift = excluded.shift, is_cover = false, cover_request_id = null, updated_at = now();
+  end if;
+  v_new_eff := coalesce(p_shift, v_base);
+  select * into v_req from public.cover_requests where requester_id = m.user_id and work_date = p_date;
+  if v_new_eff = 'V' and v_base in ('D','N') then
+    if v_req.id is null then
+      insert into public.cover_requests (team_id, requester_id, work_date, shift) values (m.team_id, m.user_id, p_date, v_base);
+    elsif v_req.status = 'cancelled' then
+      update public.cover_requests set status = 'open', shift = v_base, filled_by = null, created_at = now(), updated_at = now() where id = v_req.id;
+    end if;
+  elsif v_req.id is not null and v_req.status in ('open','filled') then
+    perform public._cancel_request(v_req.id);
+  end if;
+end $$;
+
+create or replace function public.volunteer_cover(p_request uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare m public.members := public._me(); r public.cover_requests;
+begin
+  select * into r from public.cover_requests where id = p_request for update;
+  if r.id is null or r.team_id <> m.team_id then raise exception '요청을 찾을 수 없습니다'; end if;
+  if r.status <> 'open' then raise exception '이미 마감된 요청입니다'; end if;
+  if r.requester_id = m.user_id then raise exception '본인 휴가에는 지원할 수 없습니다'; end if;
+  if coalesce(public.effective_shift(m.user_id, r.work_date), '?') <> 'O' then
+    raise exception '그날 근무가 있거나 조가 설정되지 않아 지원할 수 없습니다';
+  end if;
+  insert into public.cover_volunteers (request_id, user_id, team_id) values (r.id, m.user_id, m.team_id) on conflict do nothing;
+end $$;
+
+create or replace function public.confirm_cover(p_request uuid, p_user uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare m public.members := public._me(); r public.cover_requests;
+begin
+  select * into r from public.cover_requests where id = p_request for update;
+  if r.id is null or r.team_id <> m.team_id then raise exception '요청을 찾을 수 없습니다'; end if;
+  if r.requester_id <> m.user_id and m.role <> 'admin' then raise exception '휴가 등록자나 관리자만 확정할 수 있습니다'; end if;
+  if r.status <> 'open' then raise exception '이미 마감된 요청입니다'; end if;
+  if not exists (select 1 from public.cover_volunteers where request_id = r.id and user_id = p_user) then raise exception '지원자가 아닙니다'; end if;
+  if coalesce(public.effective_shift(p_user, r.work_date), '?') <> 'O' then raise exception '해당 지원자는 그날 근무가 있습니다'; end if;
+  update public.cover_requests set status = 'filled', filled_by = p_user, updated_at = now() where id = r.id;
+  insert into public.day_overrides (team_id, user_id, work_date, shift, is_cover, cover_request_id, updated_at)
+  values (r.team_id, p_user, r.work_date, r.shift, true, r.id, now())
+  on conflict (user_id, work_date) do update set shift = excluded.shift, is_cover = true, cover_request_id = excluded.cover_request_id, updated_at = now();
+end $$;
+
+revoke execute on function public.jo_on(uuid, date), public.effective_shift(uuid, date) from public, anon, authenticated;
+revoke execute on function public.update_my_profile(text), public.set_member_jo(uuid, text, date) from public, anon;
+grant execute on function public.update_my_profile(text), public.set_member_jo(uuid, text, date) to authenticated;
+
+alter publication supabase_realtime add table public.member_jo_history;
+
+-- ===== 근무 타입 (work_types): 고정 8종 + 개인 커스텀 =====
+-- 전체 SQL은 길어서 대시보드 Database > Migrations > work_types 를 참고하세요.
+-- 요약: day_overrides.shift 에 E(교육)·H(검진)·T(출장)·R(예비군) 추가, custom_types 테이블(본인만 보임),
+--       day_overrides.custom_type_id 추가, set_my_shift(date,text,uuid) / confirm_cover / set_member_jo 갱신
+-- custom_type_auto: custom_types.base_shift 에 'AUTO' 추가, auto_shift() 함수, set_my_shift 에서 자동 판정 (대시보드 Migrations 참고)

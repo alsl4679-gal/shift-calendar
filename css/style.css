@@ -6,11 +6,16 @@
   --text: #1a202c;
   --muted: #718096;
   --line: #e2e8f0;
-  --D-bg: #fef3c7; --D-fg: #92400e; --D: #f59e0b;
-  --N-bg: #e0e7ff; --N-fg: #3730a3; --N: #4f46e5;
-  --O-bg: #f1f5f9; --O-fg: #64748b; --O: #94a3b8;
-  --V-bg: #ffe4e6; --V-fg: #9f1239; --V: #e11d48;
-  --C-bg: #d1fae5; --C-fg: #065f46; --C: #059669;
+  /* 팀 공통 테마 (오늘근무와 비슷하게: 주 노랑 · 야 검정 · 휴 빨간 글씨) */
+  --D-bg: #ffd60a; --D-fg: #3a2f00; --D: #ffd60a;
+  --N-bg: #3d3d3d; --N-fg: #ffffff; --N: #3d3d3d;
+  --O-bg: transparent; --O-fg: #e5484d; --O: #e5484d;
+  --V-bg: #4f86f7; --V-fg: #ffffff; --V: #4f86f7;
+  --E-bg: #36c5cc; --E-fg: #ffffff;
+  --H-bg: #45b649; --H-fg: #ffffff;
+  --T-bg: #8b5cf6; --T-fg: #ffffff;
+  --R-bg: #e6ddd5; --R-fg: #4a3f38;
+  --C-bg: #ea580c; --C-fg: #ffffff; --C: #059669;
   --open: #ea580c; --open-bg: #ffedd5;
   --radius: 14px;
   --tabbar-h: 62px;
@@ -99,13 +104,17 @@ textarea { height: auto; padding: 10px 12px; resize: vertical; border: 1px solid
 .auth .link-btn { display: block; margin: 12px auto 0; }
 
 /* ---------- 근무 배지 ---------- */
-.badge { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 22px; padding: 0 6px;
-  border-radius: 6px; font-size: 12px; font-weight: 700; }
-.badge.lg { min-width: 54px; height: 32px; font-size: 16px; border-radius: 8px; }
+.badge { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 24px; padding: 0 7px;
+  border-radius: 12px; font-size: 12px; font-weight: 800; white-space: nowrap; max-width: 100%; overflow: hidden; }
+.badge.lg { min-width: 54px; height: 34px; font-size: 16px; border-radius: 17px; }
 .s-D { background: var(--D-bg); color: var(--D-fg); }
 .s-N { background: var(--N-bg); color: var(--N-fg); }
 .s-O { background: var(--O-bg); color: var(--O-fg); }
 .s-V { background: var(--V-bg); color: var(--V-fg); }
+.s-E { background: var(--E-bg); color: var(--E-fg); }
+.s-H { background: var(--H-bg); color: var(--H-fg); }
+.s-T { background: var(--T-bg); color: var(--T-fg); }
+.s-R { background: var(--R-bg); color: var(--R-fg); }
 .badge.cover { background: var(--C-bg); color: var(--C-fg); }
 
 /* ---------- 오늘 카드 ---------- */
@@ -141,7 +150,7 @@ textarea { height: auto; padding: 10px 12px; resize: vertical; border: 1px solid
 .pill { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 8px; white-space: nowrap; max-width: 100%; display: inline-block; line-height: 15px; }
 .pill.open { background: var(--open-bg); color: var(--open); }
 .pill.filled { background: var(--C-bg); color: var(--C-fg); }
-.pill.vac { background: var(--V-bg); color: var(--V-fg); }
+.pill.vac { background: #dbe7fe; color: #2556c4; }
 .me-dot { position: absolute; top: 6px; right: 6px; width: 7px; height: 7px; border-radius: 4px; }
 .me-dot.s-D { background: var(--D); }
 .me-dot.s-N { background: var(--N); }
@@ -162,8 +171,9 @@ textarea { height: auto; padding: 10px 12px; resize: vertical; border: 1px solid
 .sheet h3 { font-size: 18px; margin-bottom: 4px; }
 .sheet h3 small { font-size: 13px; }
 .sheet > p { margin: 4px 0 10px; }
-.shift-pick { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 10px 0 4px; }
-.shift-pick button { height: 64px; border-radius: 12px; font-weight: 700; display: flex; flex-direction: column; align-items: center; justify-content: center;
+.shift-pick { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 6px 0 4px; }
+.shift-pick .s-O { background: #fff0f0; }
+.shift-pick button { height: 54px; border-radius: 12px; font-weight: 700; display: flex; flex-direction: column; align-items: center; justify-content: center;
   border: 2px solid transparent; opacity: .55; }
 .shift-pick button small { font-size: 10px; font-weight: 500; }
 .shift-pick button.on { opacity: 1; border-color: currentColor; }
@@ -229,3 +239,71 @@ body.busy .busy-overlay { display: flex; }
 
 /* 팀 달력 칸: 숫자 → 근무 조 → 상태 순으로 위에서부터 */
 .cell.tcell { aspect-ratio: 1 / 1.42; justify-content: flex-start; gap: 4px; padding-top: 6px; }
+
+/* 가입 단계 */
+.step { font-size: 16px; margin: 4px 0 8px; }
+.team-badge { display: inline-block; background: #dbeafe; color: var(--navy); font-weight: 700; border-radius: 8px; padding: 6px 12px; margin-bottom: 4px; }
+.auth > .btn.block { margin-top: 4px; }
+
+/* 내 조 카드 */
+.jo-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.jo-card h4 { margin-bottom: 2px; }
+.form input[type=date] { min-height: 44px; }
+
+/* 커스텀 근무 타입 */
+.sub-label { display: flex; align-items: center; gap: 6px; margin: 14px 0 6px; font-size: 14px; font-weight: 700; }
+.sub-label em { font-style: normal; font-weight: 500; font-size: 12px; color: var(--muted); }
+.link-btn.inline { padding: 0; margin-left: auto; font-size: 13px; }
+.chip.custom { background: var(--c); color: var(--cf); opacity: .55; }
+.chip.custom.on { opacity: 1; box-shadow: 0 0 0 2px #1a202c; }
+.chip small { font-size: 10px; opacity: .85; }
+.ctype-list { list-style: none; padding: 0; margin: 8px 0; }
+.ctype-list li { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.ctype-actions { margin-left: auto; display: flex; gap: 6px; }
+.ctype-form { background: #f7fafc; border-radius: 12px; padding: 12px; margin-top: 8px; }
+.ctype-form h4 { margin-bottom: 2px; }
+.swatches { display: flex; flex-wrap: wrap; gap: 8px; }
+.swatches input { display: none; }
+.swatches span { display: block; width: 30px; height: 30px; border-radius: 15px; border: 3px solid #fff; box-shadow: 0 0 0 1px #cbd5e0; }
+.swatches input:checked + span { box-shadow: 0 0 0 2px #1a202c; }
+.tag.s-V { background: var(--V-bg); color: var(--V-fg); }
+.tag.s-E { background: var(--E-bg); color: var(--E-fg); }
+.tag.s-H { background: var(--H-bg); color: var(--H-fg); }
+.tag.s-T { background: var(--T-bg); color: var(--T-fg); }
+.tag.s-R { background: var(--R-bg); color: var(--R-fg); }
+
+/* 자동 판정 안내 */
+.auto-line { font-size: 13px; background: #fff7ed; color: #9a3412; border-radius: 10px; padding: 8px 10px; margin: 8px 0 0; }
+.link-btn.inline2 { padding: 0 0 0 6px; font-size: 13px; }
+
+/* 내 달력: 칸·배지 크게 (오늘근무처럼 동그란 배지) */
+.grid.mine { gap: 3px; }
+.grid.mine .cell { aspect-ratio: auto; height: clamp(68px, 11.2vh, 104px); justify-content: flex-start; gap: 8px; padding-top: 7px; }
+.grid.mine .dnum { font-size: 14px; }
+.grid.mine .badge { min-width: 36px; height: 36px; border-radius: 18px; font-size: 15px; padding: 0 6px; }
+.grid.mine .badge.s-O { font-size: 17px; }
+
+/* 메모: 근무 배지 아래 색 줄 (첫 줄 앞부분) */
+.grid.mine .cell { gap: 5px; height: clamp(82px, 11.4vh, 106px); }
+.grid.mine .badge { min-width: 34px; height: 34px; border-radius: 17px; }
+.memo-bar { display: block; width: calc(100% + 2px); margin: 0 -1px; height: 16px; line-height: 16px; padding: 0 3px;
+  border-radius: 3px; background: #40a35a; color: #fff; font-size: 10px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: clip; text-align: left; }
+
+/* 칸 높이·배지 크기 조정: 5주 달은 넉넉하게, 6주 달은 한 화면에 들어가게 */
+.grid.mine .cell { height: clamp(78px, 10.6vh, 100px); gap: 4px; padding-top: 6px; }
+.grid.mine .badge { min-width: 30px; height: 30px; border-radius: 15px; font-size: 14px; padding: 0 5px; }
+.grid.mine .badge.s-O { font-size: 16px; }
+.grid.mine.rows-6 .cell { height: clamp(70px, 8.9vh, 92px); gap: 3px; padding-top: 4px; }
+.grid.mine.rows-6 .badge { min-width: 28px; height: 28px; border-radius: 14px; font-size: 13px; }
+.grid.mine.rows-6 .memo-bar { height: 15px; line-height: 15px; }
+/* 오늘 카드·월 이동 줄 살짝 압축 (작은 폰에서 6주 달 들어가게) */
+.today-item { padding: 9px 12px; gap: 3px; }
+.today-item .badge.lg { min-width: 48px; height: 30px; font-size: 15px; border-radius: 15px; }
+.month-nav { margin: 6px 0 2px; }
+.top { margin-bottom: 8px; }
+
+/* 메모 띠: 칸 너비 전체에 여백 없이, 작은 글씨 (오늘근무 'JA코드' 스타일) */
+.grid.mine .cell { padding-left: 0; padding-right: 0; }
+.memo-bar, .grid.mine.rows-6 .memo-bar { width: 100%; margin: 2px 0 0; height: 13px; line-height: 13px; padding: 0 3px;
+  border-radius: 0; font-size: 9px; font-weight: 600; letter-spacing: -0.2px; }

@@ -1,5 +1,5 @@
 import { createClient } from '../vendor/supabase.js';
-import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
+import { SUPABASE_URL, SUPABASE_KEY, LOGIN_DOMAIN, COMPANY_ANCHOR, DEFAULT_FACTORY } from './config.js';
 import * as S from './shift.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
@@ -18,7 +18,7 @@ const BANS = ['가열', '압연', '냉각', '시험'];
 const VAC_TYPES = ['연차', '병가', '경조', '공가', '기타'];
 
 const state = {
-  user: null, me: null, team: null, members: [], memberMap: new Map(),
+  user: null, me: null, team: null, members: [], memberMap: new Map(), joHist: new Map(), customTypes: new Map(),
   tab: 'mine', ym: nowYM(), infoYm: nowYM(),
   overrides: new Map(), requests: [], upcoming: [], volunteers: new Map(), notes: new Map(),
   yearOverrides: null, channel: null, openSheet: null, installPrompt: null,
@@ -27,8 +27,12 @@ const state = {
 const okey = (uid, iso) => `${uid}|${iso}`;
 const memberName = (uid) => state.memberMap.get(uid)?.display_name ?? '(나간 사람)';
 const isAdmin = () => state.me?.role === 'admin';
+const joAt = (uid, iso) => S.joOn(state.joHist.get(uid), iso);
+const curJo = (member) => (member ? joAt(member.user_id, todayISO()) : null);
+const joLabel = (jo) => (jo ? `${jo}조` : '조 미설정');
 function shiftOf(member, iso) {
-  return S.effectiveShift(state.team, member.jo, iso, state.overrides.get(okey(member.user_id, iso)));
+  const jo = joAt(member.user_id, iso);
+  return { ...S.effectiveShift(state.team, jo, iso, state.overrides.get(okey(member.user_id, iso))), jo };
 }
 
 // ---------- 공통 UI ----------
@@ -54,8 +58,8 @@ function toastErr(e) {
 }
 function translateErr(m) {
   const map = [
-    [/Invalid login credentials/i, '이메일 또는 비밀번호가 틀렸습니다'],
-    [/User already registered/i, '이미 가입된 이메일입니다'],
+    [/Invalid login credentials/i, '직번 또는 비밀번호가 틀렸습니다'],
+    [/User already registered|already been registered/i, '이미 가입된 직번입니다. 로그인해 주세요'],
     [/Password should be at least/i, '비밀번호는 6자 이상이어야 합니다'],
     [/Email not confirmed/i, '이메일 인증이 아직 안 됐습니다. 메일함을 확인해 주세요'],
     [/rate limit|too many/i, '요청이 많습니다. 잠시 후 다시 시도해 주세요'],
@@ -101,9 +105,23 @@ async function withBusy(fn) {
   try { return await fn(); } finally { busy(false); }
 }
 
-function shiftBadge(shift, isCover = false, extra = '') {
+function textOn(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  const lum = (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  return lum > 0.62 ? '#2d2d2d' : '#ffffff';
+}
+function shiftBadge(shift, isCover = false, extra = '', custom = null) {
+  if (custom) return `<span class="badge ${extra}" style="background:${custom.color};color:${textOn(custom.color)}">${esc(custom.name)}</span>`;
+  if (!shift) return `<span class="badge s-O ${extra}">-</span>`;
   const info = S.SHIFT_INFO[shift];
   return `<span class="badge s-${shift}${isCover ? ' cover' : ''} ${extra}">${isCover ? '대근' : info.short}</span>`;
+}
+const baseLabel = (b) => (b === 'AUTO' ? '자동 (앞뒤 근무)' : S.SHIFT_INFO[b].label);
+const baseShort = (b) => (b === 'AUTO' ? '자동' : S.SHIFT_INFO[b].short);
+/** 내 달력용: 그날 내 커스텀 타입 (팀 달력에는 쓰지 않음) */
+function myCustom(iso) {
+  const ov = state.overrides.get(okey(state.user.id, iso));
+  return ov?.custom_type_id ? state.customTypes.get(ov.custom_type_id) || null : null;
 }
 function monthNav(ym, action) {
   return `<div class="month-nav">
@@ -142,6 +160,8 @@ async function afterLogin() {
   if (!me) return renderOnboarding();
   state.me = me;
   await loadTeam();
+  if (!state.me) return renderOnboarding();
+  if (!curJo(state.me)) return renderJoSetup();
   await loadMonth();
   subscribe();
   renderApp();
@@ -149,7 +169,7 @@ async function afterLogin() {
 
 function teardown() {
   if (state.channel) { sb.removeChannel(state.channel); state.channel = null; }
-  Object.assign(state, { me: null, team: null, members: [], memberMap: new Map(), yearOverrides: null });
+  Object.assign(state, { me: null, team: null, members: [], memberMap: new Map(), joHist: new Map(), yearOverrides: null });
   closeSheet();
 }
 
@@ -162,12 +182,19 @@ function renderFatal(e) {
 
 // ---------- 데이터 ----------
 async function loadTeam() {
-  const [t, ms] = await Promise.all([
+  const [t, ms, jh, ct] = await Promise.all([
     sb.from('teams').select('*').eq('id', state.me.team_id).maybeSingle(),
-    sb.from('members').select('*').eq('team_id', state.me.team_id).order('jo').order('display_name'),
+    sb.from('members').select('*').eq('team_id', state.me.team_id).order('display_name'),
+    sb.from('member_jo_history').select('user_id,jo,effective_from').eq('team_id', state.me.team_id).order('effective_from'),
+    sb.from('custom_types').select('*').eq('user_id', state.user.id).order('sort').order('created_at'),
   ]);
-  if (t.error) throw t.error;
-  if (ms.error) throw ms.error;
+  for (const r of [t, ms, jh, ct]) if (r.error) throw r.error;
+  state.customTypes = new Map(ct.data.map((c) => [c.id, c]));
+  state.joHist = new Map();
+  for (const h of jh.data) {
+    if (!state.joHist.has(h.user_id)) state.joHist.set(h.user_id, []);
+    state.joHist.get(h.user_id).push(h);
+  }
   state.team = t.data;
   state.members = ms.data;
   state.memberMap = new Map(ms.data.map((m) => [m.user_id, m]));
@@ -222,6 +249,7 @@ async function refresh({ team = false, quiet = false } = {}) {
       toast('팀에서 나와졌습니다');
       return renderOnboarding();
     }
+    if (!curJo(state.me)) return renderJoSetup();
     await loadMonth();
     state.yearOverrides = null;
     renderApp();
@@ -238,14 +266,14 @@ let rtToasts = [];
 function subscribe() {
   if (state.channel) sb.removeChannel(state.channel);
   const ch = sb.channel(`team-${state.team.id}`);
-  for (const table of ['day_overrides', 'cover_requests', 'cover_volunteers', 'members']) {
+  for (const table of ['day_overrides', 'cover_requests', 'cover_volunteers', 'members', 'member_jo_history']) {
     ch.on('postgres_changes', { event: '*', schema: 'public', table }, onRealtime);
   }
   ch.subscribe();
   state.channel = ch;
 }
 function onRealtime(p) {
-  if (p.table === 'members') rtMembers = true;
+  if (p.table === 'members' || p.table === 'member_jo_history') rtMembers = true;
   const n = p.new;
   if (p.table === 'cover_requests' && n && n.team_id === state.team?.id && n.status === 'open'
       && n.requester_id !== state.user.id
@@ -276,57 +304,18 @@ async function goTeamDay(iso) {
   openTeamSheet(iso);
 }
 
-// ---------- 로그인 ----------
-function renderAuth(mode = 'login', msg = '') {
-  $app.innerHTML = `<div class="auth">
-    <div class="brand"><img src="icons/icon-192.png" alt=""><h1>교대달력</h1>
-      <p class="muted">광고 없는 우리 반 교대 근무표</p></div>
-    <div class="seg">
-      <button class="${mode === 'login' ? 'on' : ''}" data-mode="login">로그인</button>
-      <button class="${mode === 'signup' ? 'on' : ''}" data-mode="signup">회원가입</button>
-    </div>
-    <form id="auth-form" class="card form">
-      <label>이메일<input name="email" type="email" autocomplete="email" required></label>
-      <label>비밀번호<input name="password" type="password" minlength="6"
-        autocomplete="${mode === 'login' ? 'current-password' : 'new-password'}" required></label>
-      ${mode === 'signup' ? '<label>비밀번호 확인<input name="password2" type="password" minlength="6" autocomplete="new-password" required></label>' : ''}
-      ${msg ? `<p class="note">${esc(msg)}</p>` : ''}
-      <button class="btn primary block" type="submit">${mode === 'login' ? '로그인' : '가입하기'}</button>
-    </form></div>`;
-  $app.querySelectorAll('[data-mode]').forEach((b) => { b.onclick = () => renderAuth(b.dataset.mode); });
-  $app.querySelector('#auth-form').onsubmit = async (e) => {
-    e.preventDefault();
-    const f = new FormData(e.target);
-    const email = f.get('email').trim();
-    const password = f.get('password');
-    if (mode === 'signup' && password !== f.get('password2')) return toast('비밀번호가 서로 다릅니다');
-    await withBusy(async () => {
-      try {
-        if (mode === 'login') {
-          const { data, error } = await sb.auth.signInWithPassword({ email, password });
-          if (error) throw error;
-          state.user = data.user;
-          await afterLogin();
-        } else {
-          const { data, error } = await sb.auth.signUp({ email, password });
-          if (error) throw error;
-          if (!data.session) return renderAuth('login', '가입 확인 메일을 보냈어요. 메일의 링크를 누른 뒤 로그인해 주세요.');
-          state.user = data.user;
-          await afterLogin();
-        }
-      } catch (err) { toastErr(err); }
-    });
-  };
-}
-
-// ---------- 팀 만들기 / 참여 ----------
+// ---------- 로그인 · 가입 (직번 + 비밀번호) ----------
 function posOptions(selected = 0) {
   return S.POS_LABELS.map((l, i) => `<option value="${i}" ${i === selected ? 'selected' : ''}>${l}</option>`).join('');
 }
-function previewText(aPos) {
+const EMP_RE = /^[A-Za-z0-9]{3,20}$/;
+const empEmail = (emp) => `${emp.trim().toLowerCase()}@${LOGIN_DOMAIN}`;
+const empOf = (user) => (user?.email || '').split('@')[0];
+
+function previewFor(team) {
   const t = todayISO();
-  const duty = S.josOnDuty({ anchor_date: t, a_pos: aPos }, t);
-  return `오늘 주간 <b>${duty.D.join('')}조</b> · 야간 <b>${duty.N.join('')}조</b>`;
+  const duty = S.josOnDuty(team, t);
+  return `오늘(${S.formatDay(t)}) 주간 <b>${duty.D.join('')}조</b> · 야간 <b>${duty.N.join('')}조</b>`;
 }
 function joSelect(name, selected = 'A') {
   return `<div class="jo-pick">${S.JOS.map((j) => `<label><input type="radio" name="${name}" value="${j}" ${j === selected ? 'checked' : ''}><span>${j}조</span></label>`).join('')}</div>`;
@@ -343,54 +332,195 @@ function wireBanField(root) {
 }
 const banValue = (f) => (f.get('ban') === '__custom' ? (f.get('ban_custom') || '').trim() : f.get('ban'));
 
-function renderOnboarding(mode = 'join') {
+const empFields = `
+  <label>직번<input name="emp" maxlength="20" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="사번(직번)" required></label>`;
+const pwFields = `
+  <label>비밀번호 <small class="muted">6자 이상</small><input name="password" type="password" minlength="6" autocomplete="new-password" required></label>
+  <label>비밀번호 확인<input name="password2" type="password" minlength="6" autocomplete="new-password" required></label>`;
+const teamFields = (factory = DEFAULT_FACTORY, ban = '압연') => `
+  <label>공장<input name="factory" maxlength="40" value="${esc(factory)}" required></label>
+  ${banField(ban)}`;
+
+function authShell(inner, small = false) {
+  return `<div class="auth">
+    <div class="brand ${small ? 'small' : ''}"><img src="icons/icon-192.png" alt=""><h1>교대달력</h1>
+      <p class="muted">광고 없는 우리 반 교대 근무표</p></div>${inner}</div>`;
+}
+
+/** 새 계정 만들기 (직번 → 내부 주소) */
+async function signUpEmp(f) {
+  const emp = (f.get('emp') || '').trim();
+  if (!EMP_RE.test(emp)) throw new Error('직번은 영문·숫자 3~20자로 입력해 주세요');
+  if (f.get('password') !== f.get('password2')) throw new Error('비밀번호가 서로 다릅니다');
+  const { data, error } = await sb.auth.signUp({
+    email: empEmail(emp), password: f.get('password'),
+    options: { data: { emp_no: emp, display_name: (f.get('name') || '').trim() } },
+  });
+  if (error) throw error;
+  if (!data.session) throw new Error('가입은 됐지만 로그인되지 않았습니다. 관리자에게 Supabase 이메일 인증 설정을 확인해 달라고 해 주세요');
+  state.user = data.user;
+}
+
+function renderAuth(mode = 'login', ctx = {}) {
+  if (mode === 'login') {
+    $app.innerHTML = authShell(`
+      <form id="f" class="card form">
+        ${empFields}
+        <label>비밀번호<input name="password" type="password" autocomplete="current-password" required></label>
+        <button class="btn primary block">로그인</button>
+      </form>
+      <button class="btn ghost block" data-go="join">처음이에요 · 초대 코드로 가입</button>
+      <button class="link-btn" data-go="create">새 팀 만들기 (팀 대표 1명만)</button>
+      <p class="muted center small-note">비밀번호를 잊으면 팀 관리자에게 문의하세요.</p>`);
+  } else if (mode === 'join') {
+    $app.innerHTML = authShell(`
+      <h3 class="step">1/2 · 초대 코드 확인</h3>
+      <form id="f" class="card form">
+        <label>초대 코드 <small class="muted">팀 관리자에게 받은 6자리</small>
+          <input name="code" maxlength="6" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="예: YX2LFP" value="${esc(ctx.code || '')}" required></label>
+        <button class="btn primary block">다음</button>
+      </form>
+      <button class="link-btn" data-go="login">← 로그인으로</button>`, true);
+  } else if (mode === 'join2') {
+    $app.innerHTML = authShell(`
+      <h3 class="step">2/2 · 내 정보</h3>
+      <div class="team-badge">${esc(ctx.team.factory)} · ${esc(ctx.team.ban)}반</div>
+      <form id="f" class="card form">
+        ${empFields}
+        <label>이름 <small class="muted">팀원에게 보이는 이름</small><input name="name" maxlength="20" required></label>
+        ${pwFields}
+        <p class="note">조는 가입 후 앱 안에서 설정해요. 인사이동 때도 언제든 바꿀 수 있습니다.</p>
+        <button class="btn primary block">가입하기</button>
+      </form>
+      <button class="link-btn" data-go="join">← 초대 코드 다시 입력</button>`, true);
+  } else if (mode === 'create') {
+    $app.innerHTML = authShell(`
+      <h3 class="step">새 팀 만들기</h3>
+      <p class="note">팀을 만든 사람이 관리자가 되고, 초대 코드를 받아 동료들에게 나눠 줍니다. 한 반에 한 번만 만들면 돼요.</p>
+      <form id="f" class="card form">
+        ${teamFields()}
+        ${empFields}
+        <label>이름<input name="name" maxlength="20" required></label>
+        ${pwFields}
+        <p class="note">근무 기준: ${previewFor(COMPANY_ANCHOR)} (회사 공통)</p>
+        <button class="btn primary block">팀 만들고 가입하기</button>
+      </form>
+      <button class="link-btn" data-go="login">← 로그인으로</button>`, true);
+    wireBanField($app.querySelector('#f'));
+  }
+  $app.querySelectorAll('[data-go]').forEach((b) => { b.onclick = () => renderAuth(b.dataset.go, ctx); });
+
+  const form = $app.querySelector('#f');
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(form);
+    await withBusy(async () => {
+      try {
+        if (mode === 'login') {
+          const emp = (f.get('emp') || '').trim();
+          const { data, error } = await sb.auth.signInWithPassword({ email: empEmail(emp), password: f.get('password') });
+          if (error) throw error;
+          state.user = data.user;
+          await afterLogin();
+        } else if (mode === 'join') {
+          const code = (f.get('code') || '').trim().toUpperCase();
+          const { data, error } = await sb.rpc('check_invite_code', { p_code: code });
+          if (error) throw error;
+          if (!data) return toast('초대 코드를 찾을 수 없습니다. 다시 확인해 주세요');
+          renderAuth('join2', { code, team: data });
+        } else if (mode === 'join2') {
+          await signUpEmp(f);
+          const { error } = await sb.rpc('join_team', { p_code: ctx.code, p_display_name: f.get('name'), p_jo: null });
+          if (error) throw error;
+          await afterLogin();
+          toast(`${ctx.team.ban}반에 가입했어요`);
+        } else if (mode === 'create') {
+          const ban = banValue(f);
+          if (!ban) return toast('반 이름을 입력해 주세요');
+          await signUpEmp(f);
+          const { error } = await sb.rpc('create_team', {
+            p_factory: f.get('factory'), p_ban: ban, p_display_name: f.get('name'), p_jo: null,
+            p_anchor: COMPANY_ANCHOR.anchor_date, p_a_pos: COMPANY_ANCHOR.a_pos,
+          });
+          if (error) throw error;
+          await afterLogin();
+          toast('팀을 만들었어요. 내 정보 탭에서 초대 코드를 공유하세요', null, 6000);
+        }
+      } catch (err) {
+        toastErr(err);
+        // 가입은 됐는데 팀 참여에서 실패한 경우 → 로그인 상태이므로 팀 설정 화면으로
+        if (state.user && (mode === 'join2' || mode === 'create')) {
+          try { await afterLogin(); } catch { /* 화면 유지 */ }
+        }
+      }
+    });
+  };
+}
+
+// ---------- 조 첫 설정 ----------
+function renderJoSetup() {
   const t = todayISO();
+  $app.innerHTML = authShell(`
+    <h3 class="step">내 조 설정</h3>
+    <div class="team-badge">${esc(state.team.factory_name)} · ${esc(state.team.ban_name)}반</div>
+    <form id="f" class="card form">
+      <div class="field"><span class="field-label">지금 내 조</span>${joSelect('jo', '')}</div>
+      <p class="note">${previewFor(state.team)}<br>인사이동이 생기면 <b>내 정보 → 조 변경</b>에서 "언제부터"와 함께 바꾸면 돼요. 이전 근무 기록은 그대로 남습니다.</p>
+      <button class="btn primary block">시작하기</button>
+    </form>
+    <button class="link-btn" data-action="logout">로그아웃</button>`, true);
+  $app.querySelector('[data-action=logout]').onclick = () => sb.auth.signOut();
+  const form = $app.querySelector('#f');
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const jo = new FormData(form).get('jo');
+    if (!jo) return toast('조를 선택해 주세요');
+    await withBusy(async () => {
+      try {
+        const { error } = await sb.rpc('set_member_jo', { p_user: null, p_jo: jo, p_from: t });
+        if (error) throw error;
+        await afterLogin();
+        toast(`${jo}조로 설정했어요`);
+      } catch (err) { toastErr(err); }
+    });
+  };
+}
+
+// ---------- 로그인은 됐는데 팀이 없을 때 (팀을 나갔거나 가입 도중 끊긴 경우) ----------
+function renderOnboarding(mode = 'join') {
+  const meta = state.user?.user_metadata || {};
   $app.innerHTML = `<div class="auth">
-    <div class="brand small"><h1>팀 설정</h1><p class="muted">같은 공장·같은 반 사람들과 달력을 공유해요</p></div>
+    <div class="brand small"><h1>팀 설정</h1><p class="muted">직번 ${esc(empOf(state.user))} · 아직 소속된 팀이 없어요</p></div>
     <div class="seg">
       <button class="${mode === 'join' ? 'on' : ''}" data-mode="join">초대 코드로 참여</button>
       <button class="${mode === 'create' ? 'on' : ''}" data-mode="create">새 팀 만들기</button>
     </div>
-    ${mode === 'join' ? `
     <form id="ob-form" class="card form">
-      <label>초대 코드<input name="code" maxlength="6" autocapitalize="characters" placeholder="예: YX2LFP" required></label>
-      <label>이름 (팀에 보이는 이름)<input name="name" maxlength="20" required></label>
-      <div class="field"><span class="field-label">내 조</span>${joSelect('jo')}</div>
-      <button class="btn primary block">참여하기</button>
-    </form>` : `
-    <form id="ob-form" class="card form">
-      <label>공장 이름<input name="factory" maxlength="40" placeholder="예: 2선재공장" required></label>
-      ${banField('압연')}
-      <label>이름 (팀에 보이는 이름)<input name="name" maxlength="20" required></label>
-      <div class="field"><span class="field-label">내 조</span>${joSelect('jo')}</div>
-      <label>오늘(${S.formatDay(t)}) A조 근무는?<select name="apos">${posOptions(0)}</select></label>
-      <p class="note preview">${previewText(0)} — 맞는지 확인해 주세요</p>
-      <button class="btn primary block">팀 만들기</button>
-    </form>`}
+      ${mode === 'join' ? `<label>초대 코드<input name="code" maxlength="6" autocapitalize="characters" placeholder="예: YX2LFP" required></label>` : teamFields()}
+      <label>이름 (팀에 보이는 이름)<input name="name" maxlength="20" value="${esc(meta.display_name || '')}" required></label>
+      ${mode === 'create' ? `<p class="note">근무 기준: ${previewFor(COMPANY_ANCHOR)} (회사 공통)</p>` : ''}
+      <button class="btn primary block">${mode === 'join' ? '참여하기' : '팀 만들기'}</button>
+    </form>
     <button class="link-btn" data-action="logout">로그아웃</button>
   </div>`;
   $app.querySelectorAll('[data-mode]').forEach((b) => { b.onclick = () => renderOnboarding(b.dataset.mode); });
   $app.querySelector('[data-action=logout]').onclick = () => sb.auth.signOut();
   const form = $app.querySelector('#ob-form');
-  if (mode === 'create') {
-    wireBanField(form);
-    const sel = form.querySelector('select[name=apos]');
-    sel.onchange = () => { form.querySelector('.preview').innerHTML = `${previewText(+sel.value)} — 맞는지 확인해 주세요`; };
-  }
+  if (mode === 'create') wireBanField(form);
   form.onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(form);
     await withBusy(async () => {
       try {
         if (mode === 'join') {
-          const { error } = await sb.rpc('join_team', { p_code: f.get('code'), p_display_name: f.get('name'), p_jo: f.get('jo') });
+          const { error } = await sb.rpc('join_team', { p_code: f.get('code'), p_display_name: f.get('name'), p_jo: null });
           if (error) throw error;
         } else {
           const ban = banValue(f);
           if (!ban) return toast('반 이름을 입력해 주세요');
           const { error } = await sb.rpc('create_team', {
-            p_factory: f.get('factory'), p_ban: ban, p_display_name: f.get('name'),
-            p_jo: f.get('jo'), p_anchor: t, p_a_pos: +f.get('apos'),
+            p_factory: f.get('factory'), p_ban: ban, p_display_name: f.get('name'), p_jo: null,
+            p_anchor: COMPANY_ANCHOR.anchor_date, p_a_pos: COMPANY_ANCHOR.a_pos,
           });
           if (error) throw error;
         }
@@ -443,6 +573,8 @@ $app.addEventListener('click', async (e) => {
   else if (act === 'goto-req') goTeamDay(a.dataset.iso);
   else if (act === 'copy-code') shareCode();
   else if (act === 'edit-profile') openProfileSheet();
+  else if (act === 'change-jo') openJoSheet(a.dataset.uid);
+  else if (act === 'custom-types') openCustomTypesSheet(null);
   else if (act === 'team-settings') openTeamSettingsSheet();
   else if (act === 'member') openMemberSheet(a.dataset.uid);
   else if (act === 'install') installApp();
@@ -464,78 +596,108 @@ function viewMine() {
     const dow = S.fromISO(iso).getDay();
     return `<button class="cell ${iso === today ? 'today' : ''} ${s.changed ? 'changed' : ''}" data-action="mine-day" data-iso="${iso}">
       <span class="dnum ${dow === 0 ? 'sun' : dow === 6 ? 'sat' : ''}">${+iso.slice(8)}</span>
-      ${shiftBadge(s.shift, s.isCover)}
-      ${note?.memo ? '<i class="memo-dot" title="메모"></i>' : ''}
+      ${shiftBadge(s.shift, s.isCover, '', myCustom(iso))}
+      ${note?.memo ? `<span class="memo-bar">${esc(note.memo.split('\n')[0])}</span>` : ''}
     </button>`;
   }).join('');
-  const card = (label, s) => `<div class="today-item">
-      <span class="muted">${label}</span>${shiftBadge(s.shift, s.isCover, 'lg')}
-      <span class="t-time">${S.SHIFT_INFO[s.shift].time || (s.shift === 'V' ? '휴가' : '쉬는 날')}</span></div>`;
-  return `<header class="top"><div><h1>${esc(state.me.display_name)} <small>${state.me.jo}조</small></h1>
+  const card = (label, s, iso) => `<div class="today-item">
+      <span class="muted">${label}</span>${shiftBadge(s.shift, s.isCover, 'lg', myCustom(iso))}
+      <span class="t-time">${s.shift ? (S.SHIFT_INFO[s.shift].time || (S.ABSENCE.has(s.shift) ? S.SHIFT_INFO[s.shift].label : '쉬는 날')) : ''}</span></div>`;
+  return `<header class="top"><div><h1>${esc(state.me.display_name)} <small>${joLabel(curJo(state.me))}</small></h1>
       <p class="muted">${esc(state.team.factory_name)} · ${esc(state.team.ban_name)}반</p></div></header>
-    <section class="today-card">${card(`오늘 ${S.formatDay(wd)}`, t0)}${card('내일', t1)}</section>
+    <section class="today-card">${card(`오늘 ${S.formatDay(wd)}`, t0, wd)}${card('내일', t1, S.addDays(wd, 1))}</section>
     ${monthNav(state.ym, 'month')}
     ${WEEK_HEAD}
-    <div class="grid">${cells}</div>
-    <p class="legend">${['D', 'N', 'O', 'V'].map((k) => shiftBadge(k)).join('')}${shiftBadge('D', true)}
-      <span class="muted">테두리 = 바꾼 날 · 점 = 메모</span></p>`;
+    <div class="grid mine rows-${S.monthGrid(y, m).length / 7}">${cells}</div>`;
 }
 
 function openMineSheet(iso) {
   const me = state.me;
   const ov = state.overrides.get(okey(me.user_id, iso));
-  const base = S.baseShift(state.team, me.jo, iso);
-  const cur = ov ? ov.shift : base;
+  const jo = joAt(me.user_id, iso);
+  const base = S.baseShift(state.team, jo, iso);
+  const cur = { shift: ov ? ov.shift : base, custom: ov?.custom_type_id || null };
   const note = state.notes.get(iso) || null;
-  let sel = cur;
+  let sel = { ...cur };
   let vtype = note?.vacation_type || '';
+  let memoCache = null;
 
   const draw = () => {
+    const customs = [...state.customTypes.values()];
+    const selCustom = sel.custom ? state.customTypes.get(sel.custom) : null;
+    const isBase = sel.shift === base && !sel.custom;
+    const needsCover = S.ABSENCE.has(sel.shift) && (base === 'D' || base === 'N');
+    const noteText = (selCustom
+      ? `"${esc(selCustom.name)}"은 내 달력에만 보이고, 팀 달력에는 "${S.SHIFT_INFO[sel.shift].label}"(으)로 표시돼요.`
+      : '근무 변경은 팀 달력에 바로 공유됩니다.')
+      + (needsCover ? ' 저장하면 팀에 "대근 필요"가 올라가요.' : '');
     const sh = openSheet(`
       <h3>${S.formatDay(iso)}</h3>
-      <p class="muted">원래 근무: ${S.SHIFT_INFO[base].label}${ov ? ` → 지금: ${ov.is_cover ? '대근 ' : ''}${S.SHIFT_INFO[ov.shift].label}` : ''}</p>
+      <p class="muted">${jo}조 · 원래 근무: ${S.SHIFT_INFO[base].label}${ov ? ` → 지금: ${ov.is_cover ? '대근 ' : ''}${S.SHIFT_INFO[ov.shift].label}` : ''}</p>
       ${ov?.is_cover ? '<p class="note warn">대근이 확정된 날이에요. 근무를 바꾸면 대근이 취소되고 다시 "대근 필요"로 돌아갑니다.</p>' : ''}
-      <div class="shift-pick">${['D', 'N', 'O', 'V'].map((k) => `<button class="s-${k} ${sel === k ? 'on' : ''}" data-s="${k}">
-        ${S.SHIFT_INFO[k].label}<small>${S.SHIFT_INFO[k].time || (k === 'V' ? '대근 요청 생성' : '')}</small></button>`).join('')}</div>
-      ${sel !== base ? `<button class="link-btn" data-s="${base}">원래 근무(${S.SHIFT_INFO[base].label})로 되돌리기</button>` : ''}
-      ${sel === 'V' ? `<div class="field"><span class="field-label">휴가 종류 <em>나만 보기</em></span>
+      <div class="sub-label">근무 <em>고정 타입 · 팀에 그대로 공유</em></div>
+      <div class="shift-pick">${S.FIXED_TYPES.map((k) => `<button class="s-${k} ${!sel.custom && sel.shift === k ? 'on' : ''}" data-s="${k}">
+        ${S.SHIFT_INFO[k].label}${k === base ? '<small>원래</small>' : ''}</button>`).join('')}</div>
+      <div class="sub-label">내 근무 타입 <em>나만 보는 이름표</em><button class="link-btn inline" data-edit-types>편집</button></div>
+      <div class="chips">${customs.length ? customs.map((c) => `<button class="chip custom ${sel.custom === c.id ? 'on' : ''}" data-c="${c.id}"
+          style="--c:${c.color};--cf:${textOn(c.color)}">${esc(c.name)} <small>${baseShort(c.base_shift)}</small></button>`).join('')
+        : '<span class="muted small-note">아직 없어요. 편집에서 만들 수 있어요 (예: 압대, 냉대).</span>'}</div>
+      ${selCustom && selCustom.base_shift === 'AUTO' && base === 'O' ? `<p class="auto-line">→ 앞뒤 근무 기준으로 <b>${S.SHIFT_INFO[sel.shift].label}</b>에 들어가요
+        <button class="link-btn inline2" data-flip>${sel.shift === 'D' ? '야간' : '주간'}으로 바꾸기</button></p>` : ''}
+      ${!isBase ? `<button class="link-btn" data-reset>원래 근무(${S.SHIFT_INFO[base].label})로 되돌리기</button>` : ''}
+      ${sel.shift === 'V' ? `<div class="field"><span class="field-label">휴가 종류 <em>나만 보기</em></span>
         <div class="chips">${VAC_TYPES.map((v) => `<button class="chip ${vtype === v ? 'on' : ''}" data-v="${v}">${v}</button>`).join('')}</div></div>` : ''}
       <label class="field"><span class="field-label">메모 <em>나만 보기</em></span>
         <textarea name="memo" rows="2" maxlength="500" placeholder="예: 병원 예약 10시">${esc(note?.memo || '')}</textarea></label>
-      <p class="note">근무 변경은 팀 달력에 바로 공유됩니다.${sel === 'V' && base !== 'O' ? ' 휴가를 저장하면 팀에 "대근 필요"가 올라가요.' : ''}</p>
+      <p class="note">${noteText}</p>
       <div class="row-btns"><button class="btn ghost" data-close>닫기</button><button class="btn primary" data-save>저장</button></div>
     `, { type: 'mine', iso });
     const memoEl = sh.querySelector('textarea');
-    sh.querySelectorAll('[data-s]').forEach((b) => { b.onclick = () => { memoCache = memoEl.value; sel = b.dataset.s; draw(); }; });
-    sh.querySelectorAll('[data-v]').forEach((b) => { b.onclick = () => { memoCache = memoEl.value; vtype = vtype === b.dataset.v ? '' : b.dataset.v; draw(); }; });
     if (memoCache !== null) memoEl.value = memoCache;
+    const keep = () => { memoCache = memoEl.value; };
+    sh.querySelectorAll('[data-s]').forEach((b) => { b.onclick = () => { keep(); sel = { shift: b.dataset.s, custom: null }; draw(); }; });
+    sh.querySelectorAll('[data-c]').forEach((b) => {
+      b.onclick = () => {
+        keep();
+        const c = state.customTypes.get(b.dataset.c);
+        const sh2 = c.base_shift === 'AUTO' ? S.autoShift(state.team, jo, iso) : c.base_shift;
+        sel = sel.custom === c.id ? { shift: base, custom: null } : { shift: sh2, custom: c.id };
+        draw();
+      };
+    });
+    sh.querySelectorAll('[data-v]').forEach((b) => { b.onclick = () => { keep(); vtype = vtype === b.dataset.v ? '' : b.dataset.v; draw(); }; });
+    sh.querySelector('[data-reset]')?.addEventListener('click', () => { keep(); sel = { shift: base, custom: null }; draw(); });
+    sh.querySelector('[data-flip]')?.addEventListener('click', () => { keep(); sel = { ...sel, shift: sel.shift === 'D' ? 'N' : 'D' }; draw(); });
+    sh.querySelector('[data-edit-types]').onclick = () => openCustomTypesSheet(iso);
     sh.querySelector('[data-close]').onclick = closeSheet;
     sh.querySelector('[data-save]').onclick = () => saveMine({ iso, base, cur, ov, note, sel, vtype, memo: memoEl.value });
   };
-  let memoCache = null;
   draw();
 }
 
 async function saveMine({ iso, base, cur, ov, note, sel, vtype, memo }) {
-  const shiftChanged = sel !== cur;
+  const shiftChanged = sel.shift !== cur.shift || (sel.custom || null) !== (cur.custom || null);
   if (ov?.is_cover && shiftChanged && !(await confirmModal('확정된 대근이 취소됩니다. 계속할까요?', '계속'))) return;
-  const newVt = sel === 'V' ? (vtype || null) : null;
+  const newVt = sel.shift === 'V' ? (vtype || null) : null;
   const newMemo = memo.trim() || null;
   const noteChanged = (note?.memo || null) !== newMemo || (note?.vacation_type || null) !== newVt;
   if (!shiftChanged && !noteChanged) return closeSheet();
   await withBusy(async () => {
     try {
       if (shiftChanged) {
-        const { error } = await sb.rpc('set_my_shift', { p_date: iso, p_shift: sel === base ? null : sel });
+        const { error } = await sb.rpc('set_my_shift', {
+          p_date: iso, p_shift: sel.shift === base && !sel.custom ? null : sel.shift, p_custom: sel.custom || null,
+        });
         if (error) throw error;
       }
       if (noteChanged) await writeNote(iso, newMemo, newVt);
       closeSheet();
       await loadMonth();
       renderApp();
+      const label = sel.custom ? state.customTypes.get(sel.custom)?.name : S.SHIFT_INFO[sel.shift].label;
       const canUndo = shiftChanged && !ov?.is_cover;
-      toast(shiftChanged ? `${S.formatDay(iso)} ${S.SHIFT_INFO[sel].label}(으)로 바꿨어요` : '메모를 저장했어요',
-        canUndo ? { label: '되돌리기', fn: () => undoMine(iso, ov?.shift ?? null, note) } : null, 6000);
+      toast(shiftChanged ? `${S.formatDay(iso)} ${label}(으)로 바꿨어요` : '메모를 저장했어요',
+        canUndo ? { label: '되돌리기', fn: () => undoMine(iso, { shift: ov?.shift ?? null, custom: ov?.custom_type_id ?? null }, note) } : null, 6000);
     } catch (e) { toastErr(e); }
   });
 }
@@ -552,10 +714,11 @@ async function writeNote(iso, memo, vt) {
   }
 }
 
-async function undoMine(iso, prevShift, prevNote) {
+async function undoMine(iso, prev, prevNote) {
   await withBusy(async () => {
     try {
-      const { error } = await sb.rpc('set_my_shift', { p_date: iso, p_shift: prevShift });
+      const custom = prev.custom && state.customTypes.has(prev.custom) ? prev.custom : null;
+      const { error } = await sb.rpc('set_my_shift', { p_date: iso, p_shift: prev.shift, p_custom: custom });
       if (error) throw error;
       await writeNote(iso, prevNote?.memo || null, prevNote?.vacation_type || null);
       await loadMonth();
@@ -563,6 +726,79 @@ async function undoMine(iso, prevShift, prevNote) {
       toast('되돌렸어요');
     } catch (e) { toastErr(e); }
   });
+}
+
+// ---------- 내 근무 타입 (커스텀) ----------
+const PALETTE = ['#e8590c', '#ff9f80', '#b05fd6', '#f06595', '#20c997', '#748ffc', '#fab005', '#82c91e', '#868e96', '#495057'];
+
+async function reloadCustomTypes() {
+  const { data, error } = await sb.from('custom_types').select('*').eq('user_id', state.user.id).order('sort').order('created_at');
+  if (error) throw error;
+  state.customTypes = new Map(data.map((c) => [c.id, c]));
+}
+
+function openCustomTypesSheet(returnIso, editId = null) {
+  const list = [...state.customTypes.values()];
+  const editing = editId ? state.customTypes.get(editId) : null;
+  const color0 = editing?.color || PALETTE[list.length % PALETTE.length];
+  const sh = openSheet(`
+    <h3>내 근무 타입</h3>
+    <p class="muted small-note">내 달력에서만 보이는 이름표예요. 팀 달력과 대근 계산에는 고른 <b>기준 근무</b>로 들어갑니다.
+      대근용 타입은 <b>자동</b>을 고르면 쉬는 날 앞뒤 근무에 맞춰 주간/야간이 정해져요.</p>
+    ${list.length ? `<ul class="ctype-list">${list.map((c) => `<li>
+      ${shiftBadge(null, false, '', c)} <span class="muted">기준: ${baseLabel(c.base_shift)}</span>
+      <span class="ctype-actions"><button class="btn ghost sm" data-edit="${c.id}">수정</button>
+      <button class="btn danger-ghost sm" data-del="${c.id}">삭제</button></span></li>`).join('')}</ul>` : ''}
+    <form id="ctf" class="form ctype-form">
+      <h4>${editing ? `"${esc(editing.name)}" 수정` : '새 타입 추가'}</h4>
+      <label>이름 <small class="muted">최대 6자</small><input name="name" maxlength="6" value="${esc(editing?.name || '')}" placeholder="예: 압대" required></label>
+      <label>기준 근무 <small class="muted">팀 달력에 이렇게 보여요</small><select name="base">
+        <option value="AUTO" ${(editing?.base_shift || 'AUTO') === 'AUTO' ? 'selected' : ''}>자동 — 근무일은 그 근무, 쉬는 날은 앞뒤 근무(주/야) · 대근용</option>
+        ${S.FIXED_TYPES.map((k) => `<option value="${k}" ${editing?.base_shift === k ? 'selected' : ''}>${S.SHIFT_INFO[k].label}</option>`).join('')}
+      </select></label>
+      <div class="field"><span class="field-label">색</span><div class="swatches">${PALETTE.map((c) => `<label>
+        <input type="radio" name="color" value="${c}" ${c === color0 ? 'checked' : ''}><span style="background:${c}"></span></label>`).join('')}</div></div>
+      ${editing ? '<p class="note">기준 근무를 바꾸면 앞으로 고르는 날부터 적용돼요. 이미 지정한 날은 그대로예요.</p>' : ''}
+      <div class="row-btns"><button type="button" class="btn ghost" data-back>${returnIso ? '돌아가기' : '닫기'}</button>
+        <button class="btn primary">${editing ? '수정 저장' : '추가'}</button></div>
+    </form>`, { type: 'custom' });
+  const back = () => { if (returnIso) openMineSheet(returnIso); else closeSheet(); };
+  sh.querySelector('[data-back]').onclick = back;
+  sh.querySelectorAll('[data-edit]').forEach((b) => { b.onclick = () => openCustomTypesSheet(returnIso, b.dataset.edit); });
+  sh.querySelectorAll('[data-del]').forEach((b) => {
+    b.onclick = async () => {
+      const c = state.customTypes.get(b.dataset.del);
+      if (!(await confirmModal(`"${c.name}" 타입을 삭제할까요? 이 타입을 쓴 날은 그날 들어간 근무(주간·야간 등)로 남아요.`, '삭제'))) return;
+      await withBusy(async () => {
+        try {
+          const { error } = await sb.from('custom_types').delete().eq('id', c.id);
+          if (error) throw error;
+          await reloadCustomTypes();
+          await loadMonth();
+          renderApp();
+          openCustomTypesSheet(returnIso);
+        } catch (e) { toastErr(e); }
+      });
+    };
+  });
+  sh.querySelector('#ctf').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const row = { name: f.get('name').trim(), base_shift: f.get('base'), color: f.get('color') };
+    if (!row.name) return toast('이름을 입력해 주세요');
+    await withBusy(async () => {
+      try {
+        const { error } = editing
+          ? await sb.from('custom_types').update(row).eq('id', editing.id)
+          : await sb.from('custom_types').insert({ ...row, user_id: state.user.id, sort: list.length });
+        if (error) throw error;
+        await reloadCustomTypes();
+        renderApp();
+        toast(editing ? '수정했어요' : `"${row.name}" 타입을 만들었어요`);
+        openCustomTypesSheet(returnIso);
+      } catch (err) { toastErr(err); }
+    });
+  };
 }
 
 // ---------- 탭 2: 팀 달력 ----------
@@ -579,13 +815,13 @@ function viewTeam() {
     const reqs = dayRequests(iso);
     const open = reqs.filter((r) => r.status === 'open').length;
     const filled = reqs.filter((r) => r.status === 'filled').length;
-    const vac = state.members.filter((mem) => shiftOf(mem, iso).shift === 'V').length;
+    const vac = state.members.filter((mem) => S.ABSENCE.has(shiftOf(mem, iso).shift)).length;
     const mine = shiftOf(state.me, iso);
     const dow = S.fromISO(iso).getDay();
     return `<button class="cell tcell ${iso === today ? 'today' : ''}" data-action="team-day" data-iso="${iso}">
       <span class="dnum ${dow === 0 ? 'sun' : dow === 6 ? 'sat' : ''}">${+iso.slice(8)}</span>
       <span class="duty"><i class="d">${duty.D.join('')}</i><i class="n">${duty.N.join('')}</i></span>
-      ${open ? `<span class="pill open">대근${open}</span>` : filled ? `<span class="pill filled">확정${filled}</span>` : vac ? `<span class="pill vac">휴가${vac}</span>` : ''}
+      ${open ? `<span class="pill open">대근${open}</span>` : filled ? `<span class="pill filled">확정${filled}</span>` : vac ? `<span class="pill vac">부재${vac}</span>` : ''}
       ${mine.shift === 'D' || mine.shift === 'N' ? `<i class="me-dot s-${mine.shift}"></i>` : ''}
     </button>`;
   }).join('');
@@ -605,10 +841,11 @@ function viewTeam() {
 }
 
 function openTeamSheet(iso) {
-  const groups = { D: [], N: [], O: [], V: [] };
+  const groups = { D: [], N: [], O: [], A: [] };
   for (const mem of state.members) {
     const s = shiftOf(mem, iso);
-    groups[s.shift].push({ mem, ...s });
+    if (!s.shift) continue;
+    groups[S.ABSENCE.has(s.shift) ? 'A' : s.shift].push({ mem, ...s });
   }
   const reqs = dayRequests(iso);
   const myShift = shiftOf(state.me, iso).shift;
@@ -637,12 +874,14 @@ function openTeamSheet(iso) {
       const mm = state.memberMap.get(v.user_id);
       const confirmBtn = r.status === 'open' && canManage
         ? `<button class="btn primary sm" data-req="confirm" data-id="${r.id}" data-uid="${v.user_id}">확정</button>` : '';
-      return `<li><span>${esc(mm?.display_name ?? '(나간 사람)')} <small>${mm?.jo ?? ''}조</small></span>${confirmBtn}</li>`;
+      return `<li><span>${esc(mm?.display_name ?? '(나간 사람)')} <small>${joAt(v.user_id, iso) ?? ''}조</small></span>${confirmBtn}</li>`;
     }).join('')}</ul>` : (r.status === 'open' ? '<p class="muted small-note">아직 지원자가 없어요</p>' : '');
     const req = state.memberMap.get(r.requester_id);
+    const absShift = state.overrides.get(okey(r.requester_id, iso))?.shift;
+    const absLabel = S.ABSENCE.has(absShift) ? S.SHIFT_INFO[absShift].label : '휴가';
     return `<div class="req-card ${r.status}">
-      <div class="req-head"><b>${esc(req?.display_name ?? '(나간 사람)')}</b> <small>${req?.jo ?? ''}조</small>
-        <span class="tag s-${r.shift}">${S.SHIFT_INFO[r.shift].label} 휴가</span>
+      <div class="req-head"><b>${esc(req?.display_name ?? '(나간 사람)')}</b> <small>${joAt(r.requester_id, iso) ?? ''}조</small>
+        <span class="tag s-${r.shift}">${S.SHIFT_INFO[r.shift].label}</span><span class="tag s-${S.ABSENCE.has(absShift) ? absShift : 'V'}">${absLabel}</span>
         ${r.status === 'open' ? '<span class="tag open">대근 필요</span>' : `<span class="tag filled">대근 확정 · ${esc(memberName(r.filled_by))}</span>`}</div>
       ${r.status === 'open' ? volList : ''}
       ${actions ? `<div class="req-actions">${actions}</div>` : ''}
@@ -650,21 +889,21 @@ function openTeamSheet(iso) {
   };
 
   const byJo = (list) => S.JOS.map((jo) => {
-    const ps = list.filter((x) => x.mem.jo === jo);
+    const ps = list.filter((x) => x.jo === jo);
     if (!ps.length) return '';
     return `<div class="jo-row"><span class="jo-tag">${jo}조</span>${ps.map((x) => `<span class="person ${x.mem.user_id === state.user.id ? 'me' : ''}">
       ${esc(x.mem.display_name)}${x.isCover ? '<em class="cover-tag">대근</em>' : x.changed ? '<em>변경</em>' : ''}</span>`).join('')}</div>`;
   }).join('') || '<p class="muted small-note">없음</p>';
 
   const reqUserIds = new Set(reqs.map((r) => r.requester_id));
-  const otherVac = groups.V.filter((x) => !reqUserIds.has(x.mem.user_id));
+  const otherVac = groups.A.filter((x) => !reqUserIds.has(x.mem.user_id));
   const duty = S.josOnDuty(state.team, iso);
 
   const sh = openSheet(`
     <h3>${S.formatDay(iso)} <small class="muted">주간 ${duty.D.join('')}조 · 야간 ${duty.N.join('')}조</small></h3>
-    ${reqs.length || otherVac.length ? `<section class="sec"><h4>휴가 · 대근</h4>
+    ${reqs.length || otherVac.length ? `<section class="sec"><h4>자리 비움 · 대근</h4>
       ${reqs.map(reqCard).join('')}
-      ${otherVac.map((x) => `<div class="req-card plain"><b>${esc(x.mem.display_name)}</b> <small>${x.mem.jo}조</small> <span class="tag">휴가 (쉬는 날)</span></div>`).join('')}
+      ${otherVac.map((x) => `<div class="req-card plain"><b>${esc(x.mem.display_name)}</b> <small>${x.jo ?? ''}조</small> <span class="tag s-${x.shift}">${S.SHIFT_INFO[x.shift].label}</span> <span class="muted">쉬는 날이라 대근 불필요</span></div>`).join('')}
     </section>` : ''}
     <section class="sec"><h4>${shiftBadge('D')} 주간 07~17 <small class="muted">${groups.D.length}명</small></h4>${byJo(groups.D)}</section>
     <section class="sec"><h4>${shiftBadge('N')} 야간 17~07 <small class="muted">${groups.N.length}명</small></h4>${byJo(groups.N)}</section>
@@ -710,14 +949,15 @@ async function fillInfo() {
   if (state.tab !== 'info') return;
   const map = state.yearOverrides.map;
   const { start, end } = S.monthRange(y, m);
-  const ms = S.periodStats(state.team, state.me.jo, start, end, map);
-  const ys = S.periodStats(state.team, state.me.jo, `${y}-01-01`, `${y}-12-31`, map);
+  const myJoAt = (iso) => joAt(state.user.id, iso);
+  const ms = S.periodStats(state.team, myJoAt, start, end, map);
+  const ys = S.periodStats(state.team, myJoAt, `${y}-01-01`, `${y}-12-31`, map);
   const tile = (label, val, unit = '', sub = '') => `<div class="tile"><span class="muted">${label}</span><b>${val}<small>${unit}</small></b>${sub ? `<span class="sub">${sub}</span>` : ''}</div>`;
 
-  const memberRows = S.JOS.map((jo) => {
-    const ps = state.members.filter((mm) => mm.jo === jo);
+  const memberRows = [...S.JOS, null].map((jo) => {
+    const ps = state.members.filter((mm) => curJo(mm) === jo);
     if (!ps.length) return '';
-    return `<div class="jo-row"><span class="jo-tag">${jo}조</span>${ps.map((mm) => `<button class="person ${mm.user_id === state.user.id ? 'me' : ''}"
+    return `<div class="jo-row"><span class="jo-tag">${jo ? `${jo}조` : '미설정'}</span>${ps.map((mm) => `<button class="person ${mm.user_id === state.user.id ? 'me' : ''}"
       ${isAdmin() && mm.user_id !== state.user.id ? `data-action="member" data-uid="${mm.user_id}"` : 'disabled'}>
       ${esc(mm.display_name)}${mm.role === 'admin' ? '<em>관리자</em>' : ''}</button>`).join('')}</div>`;
   }).join('');
@@ -729,16 +969,20 @@ async function fillInfo() {
     : isIOS ? '<p class="note">홈 화면에 추가하려면 Safari 하단 <b>공유</b> 버튼 → <b>홈 화면에 추가</b>를 누르세요.</p>' : '';
 
   root.innerHTML = `
-    <header class="top"><div><h1>${esc(state.me.display_name)} <small>${state.me.jo}조</small></h1>
-      <p class="muted">${esc(state.team.factory_name)} · ${esc(state.team.ban_name)}반 ${isAdmin() ? '· 관리자' : ''}</p></div>
+    <header class="top"><div><h1>${esc(state.me.display_name)} <small>${joLabel(curJo(state.me))}</small></h1>
+      <p class="muted">직번 ${esc(empOf(state.user))} · ${esc(state.team.factory_name)} · ${esc(state.team.ban_name)}반 ${isAdmin() ? '· 관리자' : ''}</p></div>
       <button class="chip-btn" data-action="edit-profile">수정</button></header>
+    <section class="card jo-card">
+      <div><h4>내 조 · ${joLabel(curJo(state.me))}</h4><p class="muted small-note">${joHistoryText(state.user.id)}</p></div>
+      <button class="btn ghost sm" data-action="change-jo" data-uid="${state.user.id}">조 변경</button>
+    </section>
     ${monthNav(state.infoYm, 'info-month')}
     <div class="tiles">
       ${tile('총 근무', ms.workHours, '시간', `${ms.workDays}일`)}
       ${tile('주간 / 야간', `${ms.day} / ${ms.night}`, '회')}
       ${tile('야간 시간 (22~06시)', ms.nightHours, '시간')}
       ${tile('대근', ms.cover, '회', `${ms.coverHours}시간`)}
-      ${tile('휴가', ms.vacation, '일')}
+      ${tile('휴가', ms.abs.V, '일', ['E', 'H', 'T', 'R'].filter((k) => ms.abs[k]).map((k) => `${S.SHIFT_INFO[k].label} ${ms.abs[k]}`).join(' · '))}
       ${tile(`${y}년 누적`, `휴가 ${ys.vacation}일`, '', `대근 ${ys.cover}회`)}
     </div>
     <p class="note">근무표 기준 <b>참고용</b> 계산입니다 (주간 10시간, 야간 14시간). 연장근무·실제 급여와 다를 수 있어요.</p>
@@ -750,6 +994,7 @@ async function fillInfo() {
       <p class="muted small-note">같은 공장·같은 반 동료에게만 보내 주세요.</p>
     </section>
     <section class="card"><h4>팀원 ${state.members.length}명 ${isAdmin() ? '<small class="muted">이름을 누르면 관리</small>' : ''}</h4>${memberRows}</section>
+    <button class="btn ghost block" data-action="custom-types">내 근무 타입 관리 (커스텀)</button>
     ${isAdmin() ? '<button class="btn ghost block" data-action="team-settings">팀 설정 (공장·반·근무 기준)</button>' : ''}
     ${install}
     <div class="row-btns"><button class="btn ghost" data-action="logout">로그아웃</button>
@@ -778,8 +1023,7 @@ function openProfileSheet() {
   const sh = openSheet(`<h3>내 정보 수정</h3>
     <form class="form" id="pf">
       <label>이름<input name="name" maxlength="20" value="${esc(state.me.display_name)}" required></label>
-      <div class="field"><span class="field-label">조</span>${joSelect('jo', state.me.jo)}</div>
-      <p class="note">조를 바꾸면 기본 근무표가 새 조 기준으로 바뀝니다.</p>
+      <p class="note">조는 <b>조 변경</b>에서 바꿔 주세요 (적용 시작일과 함께 기록돼요).</p>
       <div class="row-btns"><button type="button" class="btn ghost" data-close>취소</button><button class="btn primary">저장</button></div>
     </form>`, { type: 'profile' });
   sh.querySelector('[data-close]').onclick = closeSheet;
@@ -788,7 +1032,7 @@ function openProfileSheet() {
     const f = new FormData(e.target);
     await withBusy(async () => {
       try {
-        const { error } = await sb.rpc('update_my_profile', { p_display_name: f.get('name'), p_jo: f.get('jo') });
+        const { error } = await sb.rpc('update_my_profile', { p_display_name: f.get('name') });
         if (error) throw error;
         closeSheet();
         await refresh({ team: true });
@@ -805,15 +1049,15 @@ function openTeamSettingsSheet() {
     <form class="form" id="tf">
       <label>공장 이름<input name="factory" maxlength="40" value="${esc(state.team.factory_name)}" required></label>
       ${banField(state.team.ban_name)}
-      <label>오늘(${S.formatDay(t)}) A조 근무<select name="apos">${posOptions(curPos)}</select></label>
-      <p class="note preview">${previewText(curPos)}</p>
+      <label>근무 기준 보정 <small class="muted">평소엔 바꿀 필요 없음 · 오늘 A조 근무</small><select name="apos">${posOptions(curPos)}</select></label>
+      <p class="note preview">${previewFor({ anchor_date: t, a_pos: curPos })}</p>
       <div class="row-btns"><button type="button" class="btn ghost" data-newcode>초대 코드 새로 만들기</button></div>
       <div class="row-btns"><button type="button" class="btn ghost" data-close>취소</button><button class="btn primary">저장</button></div>
     </form>`, { type: 'settings' });
   const form = sh.querySelector('#tf');
   wireBanField(form);
   const sel = form.querySelector('select[name=apos]');
-  sel.onchange = () => { form.querySelector('.preview').innerHTML = previewText(+sel.value); };
+  sel.onchange = () => { form.querySelector('.preview').innerHTML = previewFor({ anchor_date: t, a_pos: +sel.value }); };
   sh.querySelector('[data-close]').onclick = closeSheet;
   sh.querySelector('[data-newcode]').onclick = async () => {
     if (!(await confirmModal('초대 코드를 새로 만들까요? 기존 코드로는 더 이상 참여할 수 없어요.', '새로 만들기'))) return;
@@ -847,16 +1091,65 @@ function openTeamSettingsSheet() {
   };
 }
 
+function joHistoryText(uid) {
+  const h = state.joHist.get(uid) || [];
+  if (!h.length) return '조가 아직 설정되지 않았어요';
+  return h.map((x, i) => {
+    const from = x.effective_from <= '2000-01-01' ? '처음' : S.formatDay(x.effective_from).split(' ')[0];
+    const next = h[i + 1];
+    const to = next ? `~${S.formatDay(S.addDays(next.effective_from, -1)).split(' ')[0]}` : '~현재';
+    return `${x.jo}조 ${from}${to}`;
+  }).join(' → ');
+}
+
+function openJoSheet(uid) {
+  const mm = state.memberMap.get(uid);
+  if (!mm) return;
+  const self = uid === state.user.id;
+  const t = todayISO();
+  const cur = curJo(mm);
+  const sh = openSheet(`<h3>${self ? '내 조 변경' : `${esc(mm.display_name)} 조 변경`}</h3>
+    <p class="muted small-note">지금: ${joLabel(cur)} · ${joHistoryText(uid)}</p>
+    <form class="form" id="jf">
+      <div class="field"><span class="field-label">새 조</span>${joSelect('jo', '')}</div>
+      <label>언제부터<input type="date" name="from" value="${t}" required></label>
+      <p class="note">이 날부터 새 조 근무표가 적용돼요. <b>이전 근무 기록은 그대로</b> 남습니다.
+        이 날 이후의 휴가·대근은 새 근무에 맞게 자동 정리돼요 (예: 새 조로 근무일이 된 날의 대근은 해제).</p>
+      <div class="row-btns"><button type="button" class="btn ghost" data-close>취소</button><button class="btn primary">변경</button></div>
+    </form>`, { type: 'jo' });
+  sh.querySelector('[data-close]').onclick = closeSheet;
+  sh.querySelector('#jf').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const jo = f.get('jo');
+    const from = f.get('from');
+    if (!jo) return toast('새 조를 선택해 주세요');
+    if (!(await confirmModal(`${S.formatDay(from)}부터 ${jo}조로 바꿀까요?`, '변경'))) return;
+    await withBusy(async () => {
+      try {
+        const { error } = await sb.rpc('set_member_jo', { p_user: self ? null : uid, p_jo: jo, p_from: from });
+        if (error) throw error;
+        closeSheet();
+        await refresh({ team: true });
+        toast(`${S.formatDay(from)}부터 ${jo}조로 바꿨어요`);
+      } catch (err) { toastErr(err); }
+    });
+  };
+}
+
 function openMemberSheet(uid) {
   const mm = state.memberMap.get(uid);
   if (!mm) return;
-  const sh = openSheet(`<h3>${esc(mm.display_name)} <small class="muted">${mm.jo}조</small></h3>
+  const sh = openSheet(`<h3>${esc(mm.display_name)} <small class="muted">${joLabel(curJo(mm))}</small></h3>
+    <p class="muted small-note">${joHistoryText(uid)}</p>
     <div class="stack">
+      <button class="btn ghost block" data-jo>조 변경 (인사이동)</button>
       <button class="btn ghost block" data-role>${mm.role === 'admin' ? '관리자 해제' : '관리자로 지정 (주임 등)'}</button>
       <button class="btn danger-ghost block" data-remove>팀에서 내보내기</button>
       <button class="btn ghost block" data-close>닫기</button>
     </div>`, { type: 'member' });
   sh.querySelector('[data-close]').onclick = closeSheet;
+  sh.querySelector('[data-jo]').onclick = () => openJoSheet(uid);
   sh.querySelector('[data-role]').onclick = () => withBusy(async () => {
     try {
       const { error } = await sb.rpc('set_member_role', { p_user: uid, p_role: mm.role === 'admin' ? 'member' : 'admin' });

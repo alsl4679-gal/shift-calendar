@@ -8,11 +8,19 @@ export const PATTERN = ['D', 'D', 'O', 'O', 'N', 'N', 'O', 'O'];
 export const JO_OFFSET = { A: 0, B: 6, C: 2, D: 4 };
 export const JOS = ['A', 'B', 'C', 'D'];
 
+// 고정 근무 타입 (커스텀 불가) — 팀 달력·대근 로직의 기준
+export const FIXED_TYPES = ['D', 'N', 'O', 'V', 'E', 'H', 'T', 'R'];
+// 자리 비움: 근무일에 걸리면 팀에 '대근 필요'
+export const ABSENCE = new Set(['V', 'E', 'H', 'T', 'R']);
 export const SHIFT_INFO = {
   D: { label: '주간', short: '주', time: '07:00~17:00', hours: 10, nightHours: 0 },
   N: { label: '야간', short: '야', time: '17:00~07:00', hours: 14, nightHours: 8 },
   O: { label: '휴무', short: '휴', time: '', hours: 0, nightHours: 0 },
   V: { label: '휴가', short: '휴가', time: '', hours: 0, nightHours: 0 },
+  E: { label: '교육', short: '교육', time: '', hours: 0, nightHours: 0 },
+  H: { label: '검진', short: '검진', time: '', hours: 0, nightHours: 0 },
+  T: { label: '출장', short: '출장', time: '', hours: 0, nightHours: 0 },
+  R: { label: '예비군', short: '예비군', time: '', hours: 0, nightHours: 0 },
 };
 
 // A조가 사이클 몇째 날인지 고를 때 쓰는 이름
@@ -85,19 +93,33 @@ export function monthRange(year, month) {
  */
 export function effectiveShift(team, jo, iso, override) {
   if (override) return { shift: override.shift, isCover: !!override.is_cover, changed: true };
+  if (!jo) return { shift: null, isCover: false, changed: false };
   return { shift: baseShift(team, jo, iso), isCover: false, changed: false };
 }
 
 /**
- * 기간 통계 (참고용)
+ * 그 날짜의 조 (인사이동 이력)
+ * history: [{ jo, effective_from }] 시작일 오름차순. 첫 이력보다 이전 날짜면 첫 조.
+ */
+export function joOn(history, iso) {
+  if (!history || !history.length) return null;
+  let jo = history[0].jo;
+  for (const h of history) { if (h.effective_from <= iso) jo = h.jo; else break; }
+  return jo;
+}
+
+/**
+ * 기간 통계 (참고용) — joAt(iso): 그날의 조
  * overridesByDate: { 'YYYY-MM-DD': {shift, is_cover} }
  */
-export function periodStats(team, jo, startIso, endIso, overridesByDate) {
-  const s = { workHours: 0, workDays: 0, day: 0, night: 0, nightHours: 0, cover: 0, coverHours: 0, vacation: 0 };
+export function periodStats(team, joAt, startIso, endIso, overridesByDate) {
+  const s = { workHours: 0, workDays: 0, day: 0, night: 0, nightHours: 0, cover: 0, coverHours: 0, vacation: 0,
+    abs: { V: 0, E: 0, H: 0, T: 0, R: 0 } };
   const n = daysBetween(startIso, endIso);
   for (let i = 0; i <= n; i++) {
     const iso = addDays(startIso, i);
-    const { shift, isCover } = effectiveShift(team, jo, iso, overridesByDate[iso]);
+    const { shift, isCover } = effectiveShift(team, joAt(iso), iso, overridesByDate[iso]);
+    if (!shift) continue;
     const info = SHIFT_INFO[shift];
     if (shift === 'D' || shift === 'N') {
       s.workDays++;
@@ -105,11 +127,26 @@ export function periodStats(team, jo, startIso, endIso, overridesByDate) {
       s.nightHours += info.nightHours;
       if (shift === 'D') s.day++; else s.night++;
       if (isCover) { s.cover++; s.coverHours += info.hours; }
-    } else if (shift === 'V') {
-      s.vacation++;
+    } else if (ABSENCE.has(shift)) {
+      s.abs[shift]++;
+      if (shift === 'V') s.vacation++;
     }
   }
   return s;
+}
+
+/**
+ * 커스텀 '자동' 타입: 근무일이면 그 근무, 쉬는 날이면 앞뒤로 붙은 본근무(주/야)
+ * 주주휴휴야야휴휴 → 휴1=주, 휴2=야, 휴3=야, 휴4=주
+ */
+export function autoShift(team, jo, iso) {
+  const cur = baseShift(team, jo, iso);
+  if (cur === 'D' || cur === 'N') return cur;
+  const prv = baseShift(team, jo, addDays(iso, -1));
+  if (prv === 'D' || prv === 'N') return prv;
+  const nxt = baseShift(team, jo, addDays(iso, 1));
+  if (nxt === 'D' || nxt === 'N') return nxt;
+  return 'D';
 }
 
 /** 그날 4개 조 중 주간/야간 조 */
