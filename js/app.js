@@ -1,6 +1,7 @@
 import { createClient } from '../vendor/supabase.js';
 import { SUPABASE_URL, SUPABASE_KEY, LOGIN_DOMAIN, COMPANY_ANCHOR, DEFAULT_FACTORY } from './config.js';
 import * as S from './shift.js';
+import { HOLIDAYS } from './holidays.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
@@ -18,7 +19,7 @@ const BANS = ['가열', '압연', '냉각', '시험'];
 const VAC_TYPES = ['연차', '병가', '경조', '공가', '기타'];
 
 const state = {
-  user: null, me: null, team: null, members: [], memberMap: new Map(), joHist: new Map(), customTypes: new Map(),
+  user: null, me: null, team: null, isOperator: false, members: [], memberMap: new Map(), joHist: new Map(), customTypes: new Map(),
   tab: 'mine', ym: nowYM(), infoYm: nowYM(),
   overrides: new Map(), requests: [], upcoming: [], volunteers: new Map(), notes: new Map(),
   yearOverrides: null, channel: null, openSheet: null, installPrompt: null,
@@ -30,6 +31,15 @@ const isAdmin = () => state.me?.role === 'admin';
 const joAt = (uid, iso) => S.joOn(state.joHist.get(uid), iso);
 const curJo = (member) => (member ? joAt(member.user_id, todayISO()) : null);
 const joLabel = (jo) => (jo ? `${jo}조` : '조 미설정');
+const activeMembers = () => state.members.filter((m) => m.status !== 'pending');
+const pendingMembers = () => state.members.filter((m) => m.status === 'pending');
+/** 칸 머리: 날짜(왼쪽) + 공휴일 이름(오른쪽) */
+function cellHead(iso, dow) {
+  const h = HOLIDAYS[iso];
+  return `<span class="cell-head"><span class="dnum ${h || dow === 0 ? 'sun' : dow === 6 ? 'sat' : ''}">${+iso.slice(8)}</span>${
+    h ? `<span class="hname">${h}</span>` : ''}</span>`;
+}
+const holidayTag = (iso) => (HOLIDAYS[iso] ? ` <span class="holiday-tag">${HOLIDAYS[iso]}</span>` : '');
 function shiftOf(member, iso) {
   const jo = joAt(member.user_id, iso);
   return { ...S.effectiveShift(state.team, jo, iso, state.overrides.get(okey(member.user_id, iso))), jo };
@@ -137,9 +147,12 @@ const WEEK_HEAD = '<div class="week-head">' + ['일', '월', '화', '수', '목'
 // ---------- 시작 ----------
 async function boot() {
   registerSW();
+  try { navigator.storage?.persist?.(); } catch { /* 지원 안 하면 무시 */ }
   window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); state.installPrompt = e; });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && state.team) refresh({ team: true, quiet: true });
+    if (document.visibilityState !== 'visible' || !state.team) return;
+    if (state.me?.status === 'pending') afterLogin().catch(() => {});
+    else refresh({ team: true, quiet: true });
   });
   sb.auth.onAuthStateChange((event) => {
     if (event === 'SIGNED_OUT') { teardown(); state.user = null; renderAuth(); }
@@ -159,8 +172,10 @@ async function afterLogin() {
   if (error) throw error;
   if (!me) return renderOnboarding();
   state.me = me;
+  try { const op = await sb.rpc('is_operator'); state.isOperator = !!op.data; } catch { state.isOperator = false; }
   await loadTeam();
   if (!state.me) return renderOnboarding();
+  if (state.me.status === 'pending') return renderPending();
   if (!curJo(state.me)) return renderJoSetup();
   await loadMonth();
   subscribe();
@@ -249,6 +264,7 @@ async function refresh({ team = false, quiet = false } = {}) {
       toast('팀에서 나와졌습니다');
       return renderOnboarding();
     }
+    if (state.me.status === 'pending') { teardown(); return afterLogin(); }
     if (!curJo(state.me)) return renderJoSetup();
     await loadMonth();
     state.yearOverrides = null;
@@ -263,6 +279,7 @@ async function refresh({ team = false, quiet = false } = {}) {
 let rtTimer = null;
 let rtMembers = false;
 let rtToasts = [];
+let rtPending = null;
 function subscribe() {
   if (state.channel) sb.removeChannel(state.channel);
   const ch = sb.channel(`team-${state.team.id}`);
@@ -274,6 +291,7 @@ function subscribe() {
 }
 function onRealtime(p) {
   if (p.table === 'members' || p.table === 'member_jo_history') rtMembers = true;
+  if (p.table === 'members' && p.eventType === 'INSERT' && p.new?.status === 'pending' && isAdmin()) rtPending = p.new;
   const n = p.new;
   if (p.table === 'cover_requests' && n && n.team_id === state.team?.id && n.status === 'open'
       && n.requester_id !== state.user.id
@@ -285,6 +303,11 @@ function onRealtime(p) {
     const team = rtMembers; rtMembers = false;
     const toasts = rtToasts; rtToasts = [];
     await refresh({ team, quiet: true });
+    if (rtPending) {
+      const pm = rtPending; rtPending = null;
+      toast(`${pm.display_name}님이 가입 승인을 기다려요`, { label: '보기', fn: () => { state.tab = 'info'; closeSheet(); renderApp(); } }, 8000);
+      return;
+    }
     const r = toasts[toasts.length - 1];
     if (r) {
       toast(`${memberName(r.requester_id)}님 ${S.formatDay(r.work_date)} ${S.SHIFT_INFO[r.shift].label} 휴가 — 대근 필요`,
@@ -357,6 +380,7 @@ async function signUpEmp(f) {
     options: { data: { emp_no: emp, display_name: (f.get('name') || '').trim() } },
   });
   if (error) throw error;
+  try { localStorage.setItem('lastEmp', emp); } catch { /* 무시 */ }
   if (!data.session) throw new Error('가입은 됐지만 로그인되지 않았습니다. 관리자에게 Supabase 이메일 인증 설정을 확인해 달라고 해 주세요');
   state.user = data.user;
 }
@@ -370,7 +394,6 @@ function renderAuth(mode = 'login', ctx = {}) {
         <button class="btn primary block">로그인</button>
       </form>
       <button class="btn ghost block" data-go="join">처음이에요 · 초대 코드로 가입</button>
-      <button class="link-btn" data-go="create">새 팀 만들기 (팀 대표 1명만)</button>
       <p class="muted center small-note">비밀번호를 잊으면 팀 관리자에게 문의하세요.</p>`);
   } else if (mode === 'join') {
     $app.innerHTML = authShell(`
@@ -384,7 +407,8 @@ function renderAuth(mode = 'login', ctx = {}) {
   } else if (mode === 'join2') {
     $app.innerHTML = authShell(`
       <h3 class="step">2/2 · 내 정보</h3>
-      <div class="team-badge">${esc(ctx.team.factory)} · ${esc(ctx.team.ban)}반</div>
+      <div class="team-badge">${esc(ctx.team.factory)} · ${esc(ctx.team.ban)}반${ctx.team.kind === 'admin' ? ' · 관리자' : ''}</div>
+      ${ctx.team.kind === 'admin' ? '<p class="note">관리자 초대 코드예요. 가입하면 승인 없이 바로 이 반의 관리자가 됩니다. (1회용)</p>' : ''}
       <form id="f" class="card form">
         ${empFields}
         <label>이름 <small class="muted">팀원에게 보이는 이름</small><input name="name" maxlength="20" required></label>
@@ -396,8 +420,10 @@ function renderAuth(mode = 'login', ctx = {}) {
   } else if (mode === 'create') {
     $app.innerHTML = authShell(`
       <h3 class="step">새 팀 만들기</h3>
-      <p class="note">팀을 만든 사람이 관리자가 되고, 초대 코드를 받아 동료들에게 나눠 줍니다. 한 반에 한 번만 만들면 돼요.</p>
+      <p class="note">팀을 만든 사람이 관리자가 되고, 초대 코드를 받아 동료들에게 나눠 줍니다. 한 반에 한 번만 만들면 돼요. 나중에 관리자를 주임에게 넘길 수 있어요.</p>
       <form id="f" class="card form">
+        <label>팀 개설 코드 <small class="muted">앱 관리자에게 받은 코드</small>
+          <input name="ccode" maxlength="12" autocapitalize="characters" autocomplete="off" spellcheck="false" required></label>
         ${teamFields()}
         ${empFields}
         <label>이름<input name="name" maxlength="20" required></label>
@@ -409,6 +435,7 @@ function renderAuth(mode = 'login', ctx = {}) {
     wireBanField($app.querySelector('#f'));
   }
   $app.querySelectorAll('[data-go]').forEach((b) => { b.onclick = () => renderAuth(b.dataset.go, ctx); });
+  if (mode === 'login') { try { const last = localStorage.getItem('lastEmp'); if (last) $app.querySelector('input[name=emp]').value = last; } catch { /* 무시 */ } }
 
   const form = $app.querySelector('#f');
   form.onsubmit = async (e) => {
@@ -420,6 +447,7 @@ function renderAuth(mode = 'login', ctx = {}) {
           const emp = (f.get('emp') || '').trim();
           const { data, error } = await sb.auth.signInWithPassword({ email: empEmail(emp), password: f.get('password') });
           if (error) throw error;
+          try { localStorage.setItem('lastEmp', emp); } catch { /* 무시 */ }
           state.user = data.user;
           await afterLogin();
         } else if (mode === 'join') {
@@ -433,14 +461,17 @@ function renderAuth(mode = 'login', ctx = {}) {
           const { error } = await sb.rpc('join_team', { p_code: ctx.code, p_display_name: f.get('name'), p_jo: null });
           if (error) throw error;
           await afterLogin();
-          toast(`${ctx.team.ban}반에 가입했어요`);
+          toast(ctx.team.kind === 'admin' ? '관리자로 가입했어요' : '가입 신청을 보냈어요. 관리자 승인을 기다려 주세요', null, 6000);
         } else if (mode === 'create') {
           const ban = banValue(f);
           if (!ban) return toast('반 이름을 입력해 주세요');
+          const ok = await sb.rpc('check_create_code', { p_code: f.get('ccode') });
+          if (ok.error) throw ok.error;
+          if (!ok.data) return toast('팀 개설 코드가 맞지 않습니다');
           await signUpEmp(f);
           const { error } = await sb.rpc('create_team', {
             p_factory: f.get('factory'), p_ban: ban, p_display_name: f.get('name'), p_jo: null,
-            p_anchor: COMPANY_ANCHOR.anchor_date, p_a_pos: COMPANY_ANCHOR.a_pos,
+            p_anchor: COMPANY_ANCHOR.anchor_date, p_a_pos: COMPANY_ANCHOR.a_pos, p_create_code: f.get('ccode'),
           });
           if (error) throw error;
           await afterLogin();
@@ -453,6 +484,36 @@ function renderAuth(mode = 'login', ctx = {}) {
           try { await afterLogin(); } catch { /* 화면 유지 */ }
         }
       }
+    });
+  };
+}
+
+// ---------- 승인 대기 ----------
+function renderPending() {
+  $app.innerHTML = authShell(`
+    <h3 class="step">가입 승인 대기 중</h3>
+    <div class="team-badge">${esc(state.team?.factory_name || '')} · ${esc(state.team?.ban_name || '')}반</div>
+    <div class="card form">
+      <p>관리자(주임)가 승인하면 바로 쓸 수 있어요.<br><span class="muted">직번 ${esc(empOf(state.user))} · ${esc(state.me.display_name)}</span></p>
+      <button class="btn primary block" data-recheck>승인됐는지 다시 확인</button>
+    </div>
+    <button class="link-btn" data-cancel>가입 신청 취소</button>
+    <button class="link-btn" data-action="logout">로그아웃</button>`, true);
+  $app.querySelector('[data-action=logout]').onclick = () => sb.auth.signOut();
+  $app.querySelector('[data-recheck]').onclick = () => withBusy(async () => {
+    try {
+      await afterLogin();
+      if (state.me?.status === 'pending') toast('아직 승인 전이에요');
+    } catch (e) { toastErr(e); }
+  });
+  $app.querySelector('[data-cancel]').onclick = async () => {
+    if (!(await confirmModal('가입 신청을 취소할까요?', '취소하기'))) return;
+    await withBusy(async () => {
+      try {
+        const { error } = await sb.rpc('leave_team');
+        if (error) throw error;
+        teardown(); renderOnboarding(); toast('가입 신청을 취소했어요');
+      } catch (e) { toastErr(e); }
     });
   };
 }
@@ -493,10 +554,10 @@ function renderOnboarding(mode = 'join') {
     <div class="brand small"><h1>팀 설정</h1><p class="muted">직번 ${esc(empOf(state.user))} · 아직 소속된 팀이 없어요</p></div>
     <div class="seg">
       <button class="${mode === 'join' ? 'on' : ''}" data-mode="join">초대 코드로 참여</button>
-      <button class="${mode === 'create' ? 'on' : ''}" data-mode="create">새 팀 만들기</button>
     </div>
     <form id="ob-form" class="card form">
-      ${mode === 'join' ? `<label>초대 코드<input name="code" maxlength="6" autocapitalize="characters" placeholder="예: YX2LFP" required></label>` : teamFields()}
+      ${mode === 'join' ? `<label>초대 코드<input name="code" maxlength="6" autocapitalize="characters" placeholder="예: YX2LFP" required></label>` : `<label>팀 개설 코드 <small class="muted">앱 관리자에게 받은 코드</small>
+          <input name="ccode" maxlength="12" autocapitalize="characters" autocomplete="off" spellcheck="false" required></label>${teamFields()}`}
       <label>이름 (팀에 보이는 이름)<input name="name" maxlength="20" value="${esc(meta.display_name || '')}" required></label>
       ${mode === 'create' ? `<p class="note">근무 기준: ${previewFor(COMPANY_ANCHOR)} (회사 공통)</p>` : ''}
       <button class="btn primary block">${mode === 'join' ? '참여하기' : '팀 만들기'}</button>
@@ -520,12 +581,12 @@ function renderOnboarding(mode = 'join') {
           if (!ban) return toast('반 이름을 입력해 주세요');
           const { error } = await sb.rpc('create_team', {
             p_factory: f.get('factory'), p_ban: ban, p_display_name: f.get('name'), p_jo: null,
-            p_anchor: COMPANY_ANCHOR.anchor_date, p_a_pos: COMPANY_ANCHOR.a_pos,
+            p_anchor: COMPANY_ANCHOR.anchor_date, p_a_pos: COMPANY_ANCHOR.a_pos, p_create_code: f.get('ccode'),
           });
           if (error) throw error;
         }
         await afterLogin();
-        toast(mode === 'join' ? '팀에 참여했어요' : '팀을 만들었어요. 내 정보 탭에서 초대 코드를 공유하세요');
+        toast(mode === 'join' ? '가입 신청을 보냈어요. 관리자 승인을 기다려 주세요' : '팀을 만들었어요. 내 정보 탭에서 초대 코드를 공유하세요');
       } catch (err) { toastErr(err); }
     });
   };
@@ -541,7 +602,8 @@ function renderApp() {
       <button class="${state.tab === 'mine' ? 'on' : ''}" data-tab="mine">${ICONS.cal}<span>내 달력</span></button>
       <button class="${state.tab === 'team' ? 'on' : ''}" data-tab="team">${ICONS.team}<span>팀 달력</span>
         ${openCount ? `<i class="dot-count">${openCount}</i>` : ''}</button>
-      <button class="${state.tab === 'info' ? 'on' : ''}" data-tab="info">${ICONS.me}<span>내 정보</span></button>
+      <button class="${state.tab === 'info' ? 'on' : ''}" data-tab="info">${ICONS.me}<span>내 정보</span>
+        ${isAdmin() && pendingMembers().length ? `<i class="dot-count">${pendingMembers().length}</i>` : ''}</button>
     </nav>`;
   if (state.tab === 'info') fillInfo();
 }
@@ -575,6 +637,21 @@ $app.addEventListener('click', async (e) => {
   else if (act === 'edit-profile') openProfileSheet();
   else if (act === 'change-jo') openJoSheet(a.dataset.uid);
   else if (act === 'custom-types') openCustomTypesSheet(null);
+  else if (act === 'operator') openOperatorSheet();
+  else if (act === 'approve' || act === 'reject') {
+    const mm = state.memberMap.get(a.dataset.uid);
+    if (act === 'reject' && !(await confirmModal(`${mm?.display_name}님의 가입 신청을 거절할까요?`, '거절'))) return;
+    await withBusy(async () => {
+      try {
+        const { error } = act === 'approve'
+          ? await sb.rpc('approve_member', { p_user: a.dataset.uid })
+          : await sb.rpc('remove_member', { p_user: a.dataset.uid });
+        if (error) throw error;
+        await refresh({ team: true });
+        toast(act === 'approve' ? `${mm?.display_name}님을 승인했어요` : '거절했어요');
+      } catch (e) { toastErr(e); }
+    });
+  }
   else if (act === 'team-settings') openTeamSettingsSheet();
   else if (act === 'member') openMemberSheet(a.dataset.uid);
   else if (act === 'install') installApp();
@@ -595,7 +672,7 @@ function viewMine() {
     const note = state.notes.get(iso);
     const dow = S.fromISO(iso).getDay();
     return `<button class="cell ${iso === today ? 'today' : ''} ${s.changed ? 'changed' : ''}" data-action="mine-day" data-iso="${iso}">
-      <span class="dnum ${dow === 0 ? 'sun' : dow === 6 ? 'sat' : ''}">${+iso.slice(8)}</span>
+      ${cellHead(iso, dow)}
       ${shiftBadge(s.shift, s.isCover, '', myCustom(iso))}
       ${note?.memo ? `<span class="memo-bar">${esc(note.memo.split('\n')[0])}</span>` : ''}
     </button>`;
@@ -632,7 +709,7 @@ function openMineSheet(iso) {
       : '근무 변경은 팀 달력에 바로 공유됩니다.')
       + (needsCover ? ' 저장하면 팀에 "대근 필요"가 올라가요.' : '');
     const sh = openSheet(`
-      <h3>${S.formatDay(iso)}</h3>
+      <h3>${S.formatDay(iso)}${holidayTag(iso)}</h3>
       <p class="muted">${jo}조 · 원래 근무: ${S.SHIFT_INFO[base].label}${ov ? ` → 지금: ${ov.is_cover ? '대근 ' : ''}${S.SHIFT_INFO[ov.shift].label}` : ''}</p>
       ${ov?.is_cover ? '<p class="note warn">대근이 확정된 날이에요. 근무를 바꾸면 대근이 취소되고 다시 "대근 필요"로 돌아갑니다.</p>' : ''}
       <div class="sub-label">근무 <em>고정 타입 · 팀에 그대로 공유</em></div>
@@ -815,11 +892,11 @@ function viewTeam() {
     const reqs = dayRequests(iso);
     const open = reqs.filter((r) => r.status === 'open').length;
     const filled = reqs.filter((r) => r.status === 'filled').length;
-    const vac = state.members.filter((mem) => S.ABSENCE.has(shiftOf(mem, iso).shift)).length;
+    const vac = activeMembers().filter((mem) => S.ABSENCE.has(shiftOf(mem, iso).shift)).length;
     const mine = shiftOf(state.me, iso);
     const dow = S.fromISO(iso).getDay();
     return `<button class="cell tcell ${iso === today ? 'today' : ''}" data-action="team-day" data-iso="${iso}">
-      <span class="dnum ${dow === 0 ? 'sun' : dow === 6 ? 'sat' : ''}">${+iso.slice(8)}</span>
+      ${cellHead(iso, dow)}
       <span class="duty"><i class="d">${duty.D.join('')}</i><i class="n">${duty.N.join('')}</i></span>
       ${open ? `<span class="pill open">대근${open}</span>` : filled ? `<span class="pill filled">확정${filled}</span>` : vac ? `<span class="pill vac">부재${vac}</span>` : ''}
       ${mine.shift === 'D' || mine.shift === 'N' ? `<i class="me-dot s-${mine.shift}"></i>` : ''}
@@ -829,7 +906,7 @@ function viewTeam() {
       <b>${S.formatDay(r.work_date)}</b> ${S.SHIFT_INFO[r.shift].label} · ${esc(memberName(r.requester_id))}
       <span class="muted">지원 ${(state.volunteers.get(r.id) || []).length}</span></button>`).join('');
   return `<header class="top"><div><h1>팀 달력</h1>
-      <p class="muted">${esc(state.team.factory_name)} · ${esc(state.team.ban_name)}반 · ${state.members.length}명</p></div>
+      <p class="muted">${esc(state.team.factory_name)} · ${esc(state.team.ban_name)}반 · ${activeMembers().length}명</p></div>
       <span class="live" title="실시간 연결">● 실시간</span></header>
     <section class="upcoming">${up ? `<h4>대근 필요 ${state.upcoming.length}건</h4><div class="req-list">${up}</div>`
       : '<p class="muted small-note">대근이 필요한 휴가가 없어요</p>'}</section>
@@ -842,7 +919,7 @@ function viewTeam() {
 
 function openTeamSheet(iso) {
   const groups = { D: [], N: [], O: [], A: [] };
-  for (const mem of state.members) {
+  for (const mem of activeMembers()) {
     const s = shiftOf(mem, iso);
     if (!s.shift) continue;
     groups[S.ABSENCE.has(s.shift) ? 'A' : s.shift].push({ mem, ...s });
@@ -900,7 +977,7 @@ function openTeamSheet(iso) {
   const duty = S.josOnDuty(state.team, iso);
 
   const sh = openSheet(`
-    <h3>${S.formatDay(iso)} <small class="muted">주간 ${duty.D.join('')}조 · 야간 ${duty.N.join('')}조</small></h3>
+    <h3>${S.formatDay(iso)}${holidayTag(iso)} <small class="muted">주간 ${duty.D.join('')}조 · 야간 ${duty.N.join('')}조</small></h3>
     ${reqs.length || otherVac.length ? `<section class="sec"><h4>자리 비움 · 대근</h4>
       ${reqs.map(reqCard).join('')}
       ${otherVac.map((x) => `<div class="req-card plain"><b>${esc(x.mem.display_name)}</b> <small>${x.jo ?? ''}조</small> <span class="tag s-${x.shift}">${S.SHIFT_INFO[x.shift].label}</span> <span class="muted">쉬는 날이라 대근 불필요</span></div>`).join('')}
@@ -955,7 +1032,7 @@ async function fillInfo() {
   const tile = (label, val, unit = '', sub = '') => `<div class="tile"><span class="muted">${label}</span><b>${val}<small>${unit}</small></b>${sub ? `<span class="sub">${sub}</span>` : ''}</div>`;
 
   const memberRows = [...S.JOS, null].map((jo) => {
-    const ps = state.members.filter((mm) => curJo(mm) === jo);
+    const ps = activeMembers().filter((mm) => curJo(mm) === jo);
     if (!ps.length) return '';
     return `<div class="jo-row"><span class="jo-tag">${jo ? `${jo}조` : '미설정'}</span>${ps.map((mm) => `<button class="person ${mm.user_id === state.user.id ? 'me' : ''}"
       ${isAdmin() && mm.user_id !== state.user.id ? `data-action="member" data-uid="${mm.user_id}"` : 'disabled'}>
@@ -993,7 +1070,15 @@ async function fillInfo() {
         <button class="btn primary sm" data-action="copy-code">공유</button></div>
       <p class="muted small-note">같은 공장·같은 반 동료에게만 보내 주세요.</p>
     </section>
-    <section class="card"><h4>팀원 ${state.members.length}명 ${isAdmin() ? '<small class="muted">이름을 누르면 관리</small>' : ''}</h4>${memberRows}</section>
+    ${isAdmin() && pendingMembers().length ? `<section class="card pending-card"><h4>가입 승인 대기 ${pendingMembers().length}명</h4>
+      <p class="muted small-note">같은 반 동료가 맞는지 이름을 확인하고 승인해 주세요.</p>
+      ${pendingMembers().map((mm) => `<div class="pending-row"><span><b>${esc(mm.display_name)}</b>
+        <small class="muted">신청 ${S.formatDay(S.toISO(new Date(mm.created_at)))}</small></span>
+        <span><button class="btn ghost sm" data-action="reject" data-uid="${mm.user_id}">거절</button>
+        <button class="btn primary sm" data-action="approve" data-uid="${mm.user_id}">승인</button></span></div>`).join('')}
+    </section>` : ''}
+    <section class="card"><h4>팀원 ${activeMembers().length}명 ${isAdmin() ? '<small class="muted">이름을 누르면 관리</small>' : ''}</h4>${memberRows}</section>
+    ${state.isOperator ? '<button class="btn primary block" data-action="operator">운영자 메뉴 (전체 팀 · 관리자 초대)</button>' : ''}
     <button class="btn ghost block" data-action="custom-types">내 근무 타입 관리 (커스텀)</button>
     ${isAdmin() ? '<button class="btn ghost block" data-action="team-settings">팀 설정 (공장·반·근무 기준)</button>' : ''}
     ${install}
@@ -1137,6 +1222,80 @@ function openJoSheet(uid) {
   };
 }
 
+// ---------- 운영자 메뉴 ----------
+async function openOperatorSheet() {
+  let teams = [];
+  try {
+    const { data, error } = await sb.rpc('op_teams');
+    if (error) throw error;
+    teams = data || [];
+  } catch (e) { return toastErr(e); }
+  const appUrl = `${location.origin}${location.pathname}`;
+  const sh = openSheet(`
+    <h3>운영자 메뉴</h3>
+    <p class="muted small-note">관리자 초대 코드는 <b>1회용</b>이에요. 받은 사람이 가입하면 바로 그 반의 관리자가 되고, 코드는 사라집니다.</p>
+    ${teams.map((t) => `<div class="op-team">
+      <div class="op-head"><b>${esc(t.factory_name)} · ${esc(t.ban_name)}반</b>
+        <span class="muted">${t.active_count}명${t.pending_count ? ` · 대기 ${t.pending_count}` : ''}</span></div>
+      <p class="muted small-note">관리자: ${esc(t.admins || '없음')}</p>
+      <div class="op-codes">
+        <span>일반 초대 <code>${esc(t.invite_code)}</code></span>
+        <span>관리자 초대 ${t.admin_invite_code ? `<code class="admin">${esc(t.admin_invite_code)}</code>` : '<em class="muted">없음</em>'}</span>
+      </div>
+      <div class="row-btns">
+        <button class="btn ghost sm" data-newadmin="${t.id}">${t.admin_invite_code ? '관리자 코드 재발급' : '관리자 코드 발급'}</button>
+        ${t.admin_invite_code ? `<button class="btn primary sm" data-shareadmin="${t.id}">관리자 코드 공유</button>` : ''}
+      </div></div>`).join('')}
+    <form id="opf" class="form ctype-form">
+      <h4>새 팀(반) 만들기</h4>
+      <p class="muted small-note">운영자는 새 팀에 들어가지 않아요. 만든 뒤 관리자 초대 코드를 그 반 주임에게 보내 주세요.</p>
+      ${teamFields()}
+      <div class="row-btns"><button type="button" class="btn ghost" data-close>닫기</button><button class="btn primary">팀 만들기</button></div>
+    </form>`, { type: 'operator' });
+  sh.querySelector('[data-close]').onclick = closeSheet;
+  wireBanField(sh.querySelector('#opf'));
+  const share = async (t, code) => {
+    const text = `교대달력 ${t.factory_name} ${t.ban_name}반 관리자 초대 코드: ${code}\n(1회용 · 이 코드로 가입하면 바로 관리자가 됩니다)\n${appUrl}`;
+    try {
+      if (navigator.share) await navigator.share({ title: '교대달력 관리자 초대', text });
+      else { await navigator.clipboard.writeText(text); toast('관리자 초대 문구를 복사했어요'); }
+    } catch (e) { if (e?.name !== 'AbortError') toast('복사하지 못했어요. 코드를 직접 알려 주세요'); }
+  };
+  sh.querySelectorAll('[data-shareadmin]').forEach((b) => {
+    b.onclick = () => { const t = teams.find((x) => x.id === b.dataset.shareadmin); share(t, t.admin_invite_code); };
+  });
+  sh.querySelectorAll('[data-newadmin]').forEach((b) => {
+    b.onclick = async () => {
+      const t = teams.find((x) => x.id === b.dataset.newadmin);
+      if (t.admin_invite_code && !(await confirmModal('새로 발급하면 이전 관리자 코드는 쓸 수 없게 돼요. 계속할까요?', '재발급'))) return;
+      await withBusy(async () => {
+        try {
+          const { error } = await sb.rpc('op_new_admin_code', { p_team: t.id });
+          if (error) throw error;
+          await openOperatorSheet();
+          toast('관리자 초대 코드를 발급했어요');
+        } catch (e) { toastErr(e); }
+      });
+    };
+  });
+  sh.querySelector('#opf').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const ban = banValue(f);
+    if (!ban) return toast('반 이름을 입력해 주세요');
+    await withBusy(async () => {
+      try {
+        const { error } = await sb.rpc('op_create_team', {
+          p_factory: f.get('factory'), p_ban: ban, p_anchor: COMPANY_ANCHOR.anchor_date, p_a_pos: COMPANY_ANCHOR.a_pos,
+        });
+        if (error) throw error;
+        await openOperatorSheet();
+        toast(`${ban}반을 만들었어요. 관리자 코드를 주임에게 보내 주세요`, null, 6000);
+      } catch (err) { toastErr(err); }
+    });
+  };
+}
+
 function openMemberSheet(uid) {
   const mm = state.memberMap.get(uid);
   if (!mm) return;
@@ -1144,12 +1303,23 @@ function openMemberSheet(uid) {
     <p class="muted small-note">${joHistoryText(uid)}</p>
     <div class="stack">
       <button class="btn ghost block" data-jo>조 변경 (인사이동)</button>
-      <button class="btn ghost block" data-role>${mm.role === 'admin' ? '관리자 해제' : '관리자로 지정 (주임 등)'}</button>
+      ${mm.role !== 'admin' ? '<button class="btn primary block" data-transfer>관리자 넘기기 (나는 일반 팀원이 됨)</button>' : ''}
+      <button class="btn ghost block" data-role>${mm.role === 'admin' ? '관리자 해제' : '관리자 추가 지정 (나도 관리자 유지)'}</button>
       <button class="btn danger-ghost block" data-remove>팀에서 내보내기</button>
       <button class="btn ghost block" data-close>닫기</button>
     </div>`, { type: 'member' });
   sh.querySelector('[data-close]').onclick = closeSheet;
   sh.querySelector('[data-jo]').onclick = () => openJoSheet(uid);
+  sh.querySelector('[data-transfer]')?.addEventListener('click', async () => {
+    if (!(await confirmModal(`${mm.display_name}님에게 관리자를 넘길까요? 나는 일반 팀원이 되고, 되돌리려면 새 관리자가 다시 지정해 줘야 해요.`, '넘기기'))) return;
+    await withBusy(async () => {
+      try {
+        const { error } = await sb.rpc('transfer_admin', { p_user: uid });
+        if (error) throw error;
+        closeSheet(); await refresh({ team: true }); toast(`${mm.display_name}님이 관리자가 됐어요`);
+      } catch (e) { toastErr(e); }
+    });
+  });
   sh.querySelector('[data-role]').onclick = () => withBusy(async () => {
     try {
       const { error } = await sb.rpc('set_member_role', { p_user: uid, p_role: mm.role === 'admin' ? 'member' : 'admin' });

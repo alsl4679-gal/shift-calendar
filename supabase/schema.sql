@@ -1,6 +1,6 @@
 -- 교대달력 DB 구조 (Supabase 프로젝트 shift-calendar 에 이미 적용됨)
 -- 새 프로젝트에 다시 만들 때만 SQL Editor에서 실행하세요.
--- 적용 이력: init_shift_schema, lock_internal_functions, invite_code_check, jo_history, work_types, custom_type_auto (위에서 아래 순서대로 실행)
+-- 적용 이력: init_shift_schema, lock_internal_functions, invite_code_check, jo_history, work_types, custom_type_auto, team_create_code_and_transfer, member_approval, operator_and_admin_invite (위에서 아래 순서대로 실행)
 -- work_types 는 Supabase 대시보드 Database > Migrations 의 'work_types' 항목과 같습니다 (대시보드 Database > Migrations 에서도 확인 가능)
 
 -- ===== Tables =====
@@ -630,3 +630,10 @@ alter publication supabase_realtime add table public.member_jo_history;
 -- 요약: day_overrides.shift 에 E(교육)·H(검진)·T(출장)·R(예비군) 추가, custom_types 테이블(본인만 보임),
 --       day_overrides.custom_type_id 추가, set_my_shift(date,text,uuid) / confirm_cover / set_member_jo 갱신
 -- custom_type_auto: custom_types.base_shift 에 'AUTO' 추가, auto_shift() 함수, set_my_shift 에서 자동 판정 (대시보드 Migrations 참고)
+-- team_create_code_and_transfer: app_settings(개설 코드 해시), check_create_code(), create_team(..., p_create_code), transfer_admin()
+--   개설 코드 설정/변경 (SQL Editor에서 실행, 코드는 대문자):
+--   insert into public.app_settings (id, team_create_code_hash) values (1, extensions.crypt('새코드', extensions.gen_salt('bf')))
+--   on conflict (id) do update set team_create_code_hash = excluded.team_create_code_hash, updated_at = now();
+-- member_approval: members.status(pending/active), my_team_id()는 active만, my_any_team_id(), approve_member(), 승인 대기자는 _me()에서 차단
+-- operator_and_admin_invite: app_operators(통합 운영자), is_operator(), teams.admin_invite_code(1회용), op_teams()/op_create_team()/op_new_admin_code(), 운영자 보호
+--   운영자 추가: insert into public.app_operators (user_id) select id from auth.users where email = '직번@iamwciscebbqhsuauitz.supabase.co';

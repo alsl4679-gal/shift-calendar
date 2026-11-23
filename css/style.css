@@ -307,3 +307,32 @@ body.busy .busy-overlay { display: flex; }
 .grid.mine .cell { padding-left: 0; padding-right: 0; }
 .memo-bar, .grid.mine.rows-6 .memo-bar { width: 100%; margin: 2px 0 0; height: 13px; line-height: 13px; padding: 0 3px;
   border-radius: 0; font-size: 9px; font-weight: 600; letter-spacing: -0.2px; }
+
+/* 칸 머리: 날짜 왼쪽 위 + 공휴일 이름 오른쪽 */
+.cell { align-items: center; }
+.cell-head { display: flex; align-items: center; gap: 2px; width: 100%; padding: 0 5px; min-height: 18px; }
+.cell-head .dnum { flex: none; font-size: 13px; line-height: 18px; }
+.hname { flex: 1; min-width: 0; text-align: right; font-size: 9px; font-weight: 600; color: #e5484d; white-space: nowrap; overflow: hidden; }
+.cell.tcell { padding-left: 0; padding-right: 0; }
+.me-dot { top: auto; bottom: 6px; right: 6px; }
+.holiday-tag { font-size: 12px; font-weight: 700; color: #e5484d; background: #fff0f0; border-radius: 6px; padding: 1px 6px; vertical-align: middle; }
+
+/* 오늘: 쨍한 파란 테두리 + 날짜 칩 */
+.cell.today { border: 2.5px solid #1e6bff; background: #eef4ff; }
+.cell.today .dnum { background: #1e6bff; color: #fff !important; border-radius: 6px; padding: 0 4px; }
+
+/* 가입 승인 */
+.pending-card { border: 2px solid #fdba74; }
+.pending-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; border-top: 1px dashed var(--line); }
+.pending-row span:last-child { display: flex; gap: 6px; }
+.cell-head { padding: 0 3px 0 4px; gap: 1px; }
+.hname { font-size: 8.5px; letter-spacing: -0.4px; }
+.hname { font-size: 8px; }
+
+/* 운영자 메뉴 */
+.op-team { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin: 10px 0; }
+.op-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.op-codes { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; margin-top: 4px; }
+.op-codes code { font-family: ui-monospace, Menlo, monospace; font-weight: 800; letter-spacing: 1px; background: #edf2f7; border-radius: 6px; padding: 1px 6px; }
+.op-codes code.admin { background: #fff3bf; color: #7c5e00; }
+.op-team .row-btns { margin-top: 8px; }
