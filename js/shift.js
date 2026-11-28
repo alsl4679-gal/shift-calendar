@@ -1,7 +1,5 @@
 // 근무 계산 로직 (화면과 분리 — 나중에 Dart로 옮기기 쉽게)
 
-import { HOLIDAYS } from './holidays.js';
-
 // 8일 주기: 주주휴휴야야휴휴
 export const PATTERN = ['D', 'D', 'O', 'O', 'N', 'N', 'O', 'O'];
 
@@ -64,14 +62,14 @@ const mod = (n, m) => ((n % m) + m) % m;
 export function dayPeriodOn(team, iso) {
   return (team?.day_periods || []).find((p) => p.start_date <= iso && iso <= p.end_date) || null;
 }
+/** 원래 4조 2교대 순서 (일시 주간 반영 전) */
+export function patternShift(team, jo, iso) {
+  return PATTERN[mod(team.a_pos + JO_OFFSET[jo] + daysBetween(team.anchor_date, iso), 8)];
+}
+/** 일시 주간 기간에는 순서는 그대로, 야간만 주간으로 (휴무는 그대로) */
 export function baseShift(team, jo, iso) {
-  const p = jo ? dayPeriodOn(team, iso) : null;
-  if (p) {
-    const dow = fromISO(iso).getDay();
-    return p.off_weekends && (dow === 0 || dow === 6 || HOLIDAYS[iso]) ? 'O' : 'D';
-  }
-  const pos = mod(team.a_pos + JO_OFFSET[jo] + daysBetween(team.anchor_date, iso), 8);
-  return PATTERN[pos];
+  const s = patternShift(team, jo, iso);
+  return s === 'N' && jo && dayPeriodOn(team, iso) ? 'D' : s;
 }
 
 /** 근무일 기준 '오늘' — 07시 전이면 전날 근무(야간 중)로 본다 */

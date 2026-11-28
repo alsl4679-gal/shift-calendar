@@ -53,12 +53,23 @@ function cellHead(iso, dow, extra = '') {
 }
 const installDismissed = () => { try { return localStorage.getItem('installDismissed') === '1'; } catch { return false; } };
 const holidayTag = (iso) => (HOLIDAYS[iso] ? ` <span class="holiday-tag">${HOLIDAYS[iso]}</span>` : '');
+/** 일시 주간 선택: 'apply' | 'keep' | undefined(미결정) */
+const periodChoice = (uid, eid) => state.periodChoices?.get(`${uid}:${eid}`);
+const teamCache = new Map();
+/** 사람별로 볼 팀 설정: 그 사람이 '반영'한 일시 주간 기간만 포함 (결정 전·그대로 = 원래 근무) */
+function teamFor(uid) {
+  if (!state.team) return state.team;
+  if (!teamCache.has(uid)) {
+    teamCache.set(uid, { ...state.team, day_periods: (state.team.day_periods || []).filter((p) => periodChoice(uid, p.id) === 'apply') });
+  }
+  return teamCache.get(uid);
+}
 function shiftOf(member, iso) {
   const jo = joAt(member.user_id, iso);
   const ov = state.overrides.get(okey(member.user_id, iso));
-  const s = S.effectiveShift(state.team, jo, iso, ov);
+  const s = S.effectiveShift(teamFor(member.user_id), jo, iso, ov);
   // 대근 = 확정된 대근 + 원래 쉬는 날 근무 (인원부족 대근·직접 입력)
-  const extra = s.isCover || (!!ov && !!jo && (s.shift === 'D' || s.shift === 'N') && S.baseShift(state.team, jo, iso) === 'O');
+  const extra = s.isCover || (!!ov && !!jo && (s.shift === 'D' || s.shift === 'N') && S.baseShift(teamFor(member.user_id), jo, iso) === 'O');
   return { ...s, jo, extra };
 }
 /** 조별 정원 (팀 설정, 없으면 인원부족 표시 안 함) */
@@ -121,17 +132,79 @@ function confirmModal(text, okLabel = '확인') {
   });
 }
 
+/** 선택 창: 'ok' | 'cancel' | 'later' | null(바깥 눌러 닫음 = 나중에) */
+function choiceModal({ title, text, ok, cancel, later = null, note = '' }) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal-back';
+    wrap.innerHTML = `<div class="modal">${title ? `<h4 class="modal-title">${esc(title)}</h4>` : ''}<p>${esc(text)}</p>
+      ${note ? `<p class="muted small-note">${esc(note)}</p>` : ''}
+      <div class="stack"><button class="btn primary block" data-r="ok">${esc(ok)}</button><button class="btn ghost block" data-r="cancel">${esc(cancel)}</button>
+        ${later ? `<button class="link-btn later-btn" data-r="later">${esc(later)}</button>` : ''}</div></div>`;
+    wrap.onclick = (e) => {
+      const r = e.target.closest('[data-r]');
+      if (r || e.target === wrap) { wrap.remove(); resolve(r ? r.dataset.r : null); }
+    };
+    document.body.appendChild(wrap);
+  });
+}
+
 function openSheet(html, meta) {
   state.openSheet = meta;
   $sheet.innerHTML = `<div class="sheet-back"></div><div class="sheet" role="dialog"><div class="grab"></div>${html}</div>`;
   $sheet.querySelector('.sheet-back').onclick = closeSheet;
+  document.body.classList.add('sheet-open');
   requestAnimationFrame(() => $sheet.classList.add('open'));
-  return $sheet.querySelector('.sheet');
+  const el = $sheet.querySelector('.sheet');
+  bindSheetDrag(el);
+  return el;
 }
 function closeSheet() {
   state.openSheet = null;
   $sheet.classList.remove('open');
   $sheet.innerHTML = '';
+  document.body.classList.remove('sheet-open');
+}
+/** 하단 카드: 내용이 맨 위일 때 아래로 끌어서 닫기 (일반 앱처럼) */
+function bindSheetDrag(el) {
+  let y0 = null; let dy = 0; let dragging = false; let t0 = 0;
+  const back = () => $sheet.querySelector('.sheet-back');
+  el.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) { y0 = null; return; }
+    y0 = e.touches[0].clientY; dy = 0; dragging = false; t0 = Date.now();
+  }, { passive: true });
+  el.addEventListener('touchmove', (e) => {
+    if (y0 === null) return;
+    const d = e.touches[0].clientY - y0;
+    if (!dragging) {
+      if (el.scrollTop > 0 || d < 0) { y0 = null; return; } // 위로 밀거나 내용이 스크롤된 상태면 그냥 스크롤
+      if (d === 0) return;
+      dragging = true;
+    }
+    e.preventDefault();
+    dy = Math.max(0, d);
+    el.style.transition = 'none';
+    el.style.transform = `translateY(${dy}px)`;
+    if (back()) back().style.opacity = String(Math.max(0.15, 1 - dy / 350));
+  }, { passive: false });
+  const end = () => {
+    if (y0 === null) return;
+    y0 = null;
+    if (!dragging) return;
+    dragging = false;
+    const speed = dy / Math.max(1, Date.now() - t0); // px/ms
+    el.style.transition = '';
+    if (dy > 100 || (dy > 30 && speed > 0.4)) {
+      el.style.transform = 'translateY(100%)';
+      if (back()) back().style.opacity = '0';
+      setTimeout(() => { if ($sheet.contains(el)) closeSheet(); }, 180);
+    } else {
+      el.style.transform = '';
+      if (back()) back().style.opacity = '';
+    }
+  };
+  el.addEventListener('touchend', end);
+  el.addEventListener('touchcancel', end);
 }
 
 function busy(on) {
@@ -249,14 +322,17 @@ function renderFatal(e) {
 
 // ---------- 데이터 ----------
 async function loadTeam() {
-  const [t, ms, jh, ct, dp] = await Promise.all([
+  const [t, ms, jh, ct, dp, pc] = await Promise.all([
     sb.from('teams').select('*').eq('id', state.me.team_id).maybeSingle(),
     sb.from('members').select('*').eq('team_id', state.me.team_id).order('display_name'),
     sb.from('member_jo_history').select('user_id,jo,effective_from').eq('team_id', state.me.team_id).order('effective_from'),
     sb.from('custom_types').select('*').eq('user_id', state.user.id).order('sort').order('created_at'),
-    sb.from('team_events').select('id,title,start_date,end_date,off_weekends').eq('team_id', state.me.team_id).eq('all_day_shift', true).order('start_date'),
+    sb.from('team_events').select('id,title,start_date,end_date,updated_at').eq('team_id', state.me.team_id).eq('all_day_shift', true).order('start_date'),
+    sb.from('period_choices').select('user_id,event_id,choice').eq('team_id', state.me.team_id),
   ]);
-  for (const r of [t, ms, jh, ct, dp]) if (r.error) throw r.error;
+  for (const r of [t, ms, jh, ct, dp, pc]) if (r.error) throw r.error;
+  state.periodChoices = new Map((pc.data || []).map((c) => [`${c.user_id}:${c.event_id}`, c.choice]));
+  teamCache.clear();
   state.customTypes = new Map(ct.data.map((c) => [c.id, c]));
   state.joHist = new Map();
   for (const h of jh.data) {
@@ -351,14 +427,14 @@ let rtSelfAccept = null;
 function subscribe() {
   if (state.channel) sb.removeChannel(state.channel);
   const ch = sb.channel(`team-${state.team.id}`);
-  for (const table of ['day_overrides', 'cover_requests', 'cover_volunteers', 'members', 'member_jo_history', 'team_events', 'polls', 'poll_votes']) {
+  for (const table of ['day_overrides', 'cover_requests', 'cover_volunteers', 'members', 'member_jo_history', 'team_events', 'polls', 'poll_votes', 'period_choices']) {
     ch.on('postgres_changes', { event: '*', schema: 'public', table }, onRealtime);
   }
   ch.subscribe();
   state.channel = ch;
 }
 function onRealtime(p) {
-  if (p.table === 'members' || p.table === 'member_jo_history' || p.table === 'team_events') rtMembers = true;
+  if (['members', 'member_jo_history', 'team_events', 'period_choices'].includes(p.table)) rtMembers = true;
   if (p.table === 'members' && p.eventType === 'INSERT' && p.new?.status === 'pending'
       && (isSuper() || (isAdmin() && p.new.jo && p.new.jo === curJo(state.me)))) rtPending = p.new;
   if (p.table === 'cover_requests' && p.eventType === 'UPDATE' && p.new?.status === 'filled' && p.new.filled_by === state.user.id
@@ -734,7 +810,55 @@ function renderApp() {
         ${myPendingList().length ? `<i class="dot-count">${myPendingList().length}</i>` : ''}</button>
     </nav>`;
   if (state.tab === 'info') fillInfo();
+  if (state.tab === 'mine') setTimeout(checkPeriodNotice, 300);
 }
+
+// ---------- 팀 일정(일시 주간): 내 근무에 반영할지 묻기 ----------
+let periodNoticeBusy = false;
+const periodSnoozed = new Set(); // '나중에': 앱을 다시 열 때까지 묻지 않음
+/** 그 기간 내 원래 야간 날짜 (반영하면 주간으로 바뀌는 날) */
+function myNightDays(p) {
+  const days = [];
+  for (let d = p.start_date; d <= p.end_date; d = S.addDays(d, 1)) {
+    const jo = joAt(state.user.id, d);
+    if (jo && S.patternShift(state.team, jo, d) === 'N') days.push(d);
+  }
+  return days;
+}
+async function checkPeriodNotice() {
+  if (periodNoticeBusy || state.family || state.tab !== 'mine' || state.openSheet || !state.me || state.me.is_part) return;
+  if (document.querySelector('.modal-back')) return;
+  const t = todayISO();
+  for (const p of state.team?.day_periods || []) {
+    if (p.end_date < t || periodChoice(state.user.id, p.id) || periodSnoozed.has(p.id)) continue;
+    const days = myNightDays(p);
+    if (!days.length) continue;
+    periodNoticeBusy = true;
+    try {
+      const r = await choiceModal({
+        title: '🏭 팀 일정이 바뀌었어요',
+        text: `"${p.title}" (${md(p.start_date)}~${md(p.end_date)}) 기간에 야간조도 주간으로 근무해요. 반영하면 내 야간 ${days.length}일이 주간으로 바뀌어요.`,
+        note: '결정하기 전까지는 원래 근무(야간)로 보여요. 나중에 그날을 눌러 바꿀 수도 있어요.',
+        ok: '반영하기', cancel: '내 달력은 그대로 (야간 유지)', later: '나중에 결정할게요',
+      });
+      if (r === 'ok' || r === 'cancel') await setPeriodChoice(p, r === 'ok' ? 'apply' : 'keep');
+      else periodSnoozed.add(p.id);
+    } finally { periodNoticeBusy = false; }
+    return; // 한 번에 하나씩
+  }
+}
+async function setPeriodChoice(p, choice, { reopen = null } = {}) {
+  await withBusy(async () => {
+    try {
+      const { error } = await sb.rpc('set_period_choice', { p_event: p.id, p_choice: choice });
+      if (error) throw error;
+      await loadTeam(); await loadMonth(); renderApp();
+      if (reopen) openMineSheet(reopen);
+      toast(choice === 'apply' ? `"${p.title}" 일시 주간을 내 달력에 반영했어요` : '내 달력은 원래 근무(야간) 그대로예요', null, 5000);
+    } catch (e) { toastErr(e); }
+  });
+}
+
 
 $app.addEventListener('touchstart', (e) => {
   const onCal = e.target.closest('.grid') && (state.family || state.tab === 'mine' || state.tab === 'team');
@@ -905,7 +1029,9 @@ function openMineSheet(iso) {
   const me = state.me;
   const ov = state.overrides.get(okey(me.user_id, iso));
   const jo = joAt(me.user_id, iso);
-  const base = S.baseShift(state.team, jo, iso);
+  const base = S.baseShift(teamFor(me.user_id), jo, iso);
+  const period = S.dayPeriodOn(state.team, iso);
+  const periodNight = !!jo && S.patternShift(state.team, jo, iso) === 'N';
   const cur = { shift: ov ? ov.shift : base, custom: ov?.custom_type_id || null };
   const note = state.notes.get(iso) || null;
   let sel = { ...cur };
@@ -926,6 +1052,8 @@ function openMineSheet(iso) {
     const sh = openSheet(`
       <h3>${S.formatDay(iso)}${holidayTag(iso)}</h3>
       ${eventsLine(iso)}
+      ${period && periodNight ? `<div class="period-line">🏭 일시 주간 기간 · <b>${periodChoice(me.user_id, period.id) === 'apply' ? '내 달력에 반영함' : periodChoice(me.user_id, period.id) === 'keep' ? '반영 안 함 (야간 유지)' : '아직 결정 안 함 (야간)'}</b>
+        <button class="chip-btn" data-pchoice="${periodChoice(me.user_id, period.id) === 'apply' ? 'keep' : 'apply'}">${periodChoice(me.user_id, period.id) === 'apply' ? '반영 취소' : '반영하기'}</button></div>` : ''}
       <p class="muted">${jo}조 · 원래 근무: ${S.SHIFT_INFO[base].label}${ov ? ` → 지금: ${ov.is_cover ? '대근 ' : ''}${S.SHIFT_INFO[ov.shift].label}` : ''}</p>
       ${ov?.is_cover ? '<p class="note warn">대근이 확정된 날이에요. 근무를 바꾸면 대근이 취소되고 다시 "대근 필요"로 돌아갑니다.</p>' : ''}
       <div class="sub-label">근무 <em>고정 타입 · 팀에 그대로 공유</em></div>
@@ -965,7 +1093,7 @@ function openMineSheet(iso) {
       b.onclick = () => {
         keep();
         const c = state.customTypes.get(b.dataset.c);
-        const sh2 = c.base_shift === 'AUTO' ? S.autoShift(state.team, jo, iso) : c.base_shift;
+        const sh2 = c.base_shift === 'AUTO' ? S.autoShift(teamFor(me.user_id), jo, iso) : c.base_shift;
         sel = sel.custom === c.id ? { shift: base, custom: null } : { shift: sh2, custom: c.id };
         draw();
       };
@@ -975,6 +1103,7 @@ function openMineSheet(iso) {
     sh.querySelector('[data-flip]')?.addEventListener('click', () => { keep(); sel = { ...sel, shift: sel.shift === 'D' ? 'N' : 'D' }; draw(); });
     sh.querySelector('[data-edit-types]').onclick = () => openCustomTypesSheet(iso);
     sh.querySelector('[data-close]').onclick = closeSheet;
+    sh.querySelector('[data-pchoice]')?.addEventListener('click', (e) => setPeriodChoice(period, e.currentTarget.dataset.pchoice, { reopen: iso }));
     sh.querySelector('[data-save]').onclick = () => {
       keep();
       const kept = memos.map((x) => ({ t: x.t.trim(), c: x.c })).filter((x) => x.t);
@@ -1158,7 +1287,7 @@ function eventStrip(iso) {
 function eventsLine(iso) {
   const evs = eventsOn(iso);
   return evs.length ? `<div class="ev-lines">${evs.map((e) => `<div class="ev-line"><i style="background:${e.color}"></i>
-    <b>${esc(e.title)}</b>${state.team?.day_periods?.some((p) => p.id === e.id) ? ' <span class="tag allday">전원 주간</span>' : ''} <span class="muted">${md(e.start_date)}${e.end_date !== e.start_date ? `~${md(e.end_date)}` : ''}</span>
+    <b>${esc(e.title)}</b>${state.team?.day_periods?.some((p) => p.id === e.id) ? ' <span class="tag allday">일시 주간</span>' : ''} <span class="muted">${md(e.start_date)}${e.end_date !== e.start_date ? `~${md(e.end_date)}` : ''}</span>
     ${e.note ? `<div class="muted small-note">${esc(e.note)}</div>` : ''}</div>`).join('')}</div>` : '';
 }
 
@@ -1176,8 +1305,8 @@ async function openEventsSheet(editId = null) {
     <h3>🏭 팀 일정</h3>
     <p class="muted small-note">대수리처럼 반 전체에 해당하는 일정이에요. 팀원 모두의 내 달력·팀 달력에 표시돼요.</p>
     ${list.length ? `<ul class="ctype-list">${list.map((e) => `<li>
-      <span class="ev-dot" style="background:${e.color}"></span><span><b>${esc(e.title)}</b>${e.all_day_shift ? ' <span class="tag allday">전원 주간</span>' : ''}
-      <small class="muted">${md(e.start_date)}${e.end_date !== e.start_date ? `~${md(e.end_date)}` : ''}${e.all_day_shift && e.off_weekends ? ' · 주말·공휴일 휴무' : ''}</small></span>
+      <span class="ev-dot" style="background:${e.color}"></span><span><b>${esc(e.title)}</b>${e.all_day_shift ? ' <span class="tag allday">일시 주간</span>' : ''}
+      <small class="muted">${md(e.start_date)}${e.end_date !== e.start_date ? `~${md(e.end_date)}` : ''}</small></span>
       ${canSchedule() ? `<span class="ctype-actions"><button class="btn ghost sm" data-eedit="${e.id}">수정</button>
       <button class="btn danger-ghost sm" data-edel="${e.id}">삭제</button></span>` : ''}</li>`).join('')}</ul>` : '<p class="muted small-note">등록된 일정이 없어요.</p>'}
     ${canSchedule() ? `<form id="evf" class="form ctype-form">
@@ -1187,17 +1316,14 @@ async function openEventsSheet(editId = null) {
         <label>끝<input type="date" name="end" value="${editing?.end_date || t}" required></label></div>
       <label>메모 <small class="muted">선택</small><input name="note" maxlength="300" value="${esc(editing?.note || '')}" placeholder="예: 공장 가동 중지, 설비 정비"></label>
       <div class="allday-box">
-        <label class="check-row"><input type="checkbox" name="allday" ${editing?.all_day_shift ? 'checked' : ''}> <b>이 기간 4개조 전원 일시 주간</b></label>
-        <label class="check-row sub"><input type="checkbox" name="offwk" ${editing?.off_weekends ? 'checked' : ''} ${editing?.all_day_shift ? '' : 'disabled'}> 토·일·공휴일은 휴무</label>
-        <p class="muted small-note">켜면 이 기간 모두의 근무가 주간(07~19)으로 바뀌고, 휴가를 내도 대근 요청이 생기지 않아요.</p>
+        <label class="check-row"><input type="checkbox" name="allday" ${editing?.all_day_shift ? 'checked' : ''}> <b>이 기간 일시 주간 (야간조도 주간 근무)</b></label>
+        <p class="muted small-note">4조 2교대 순서는 그대로, 야간 근무만 주간(07~19)으로 바뀌어요. 쉬는 날은 그대로 쉬고, 휴가를 내도 대근 요청은 생기지 않아요.</p>
       </div>
       ${colorField(color0)}
       <div class="row-btns"><button type="button" class="btn ghost" data-close>닫기</button><button class="btn primary">${editing ? '수정 저장' : '추가'}</button></div>
     </form>` : '<div class="row-btns"><button class="btn ghost block" data-close>닫기</button></div>'}`, { type: 'events' });
   sh.querySelector('[data-close]').onclick = closeSheet;
   wireColorPicker(sh);
-  const allday = sh.querySelector('input[name=allday]');
-  allday?.addEventListener('change', () => { const o = sh.querySelector('input[name=offwk]'); o.disabled = !allday.checked; if (!allday.checked) o.checked = false; });
   sh.querySelectorAll('[data-eedit]').forEach((b) => { b.onclick = () => openEventsSheet(b.dataset.eedit); });
   sh.querySelectorAll('[data-edel]').forEach((b) => {
     b.onclick = async () => {
@@ -1222,7 +1348,7 @@ async function openEventsSheet(editId = null) {
         const { error } = await sb.rpc('save_team_event', {
           p_id: editing?.id || null, p_title: f.get('title'), p_start: f.get('start'), p_end: f.get('end'),
           p_color: f.get('color'), p_note: f.get('note'),
-          p_all_day: f.get('allday') === 'on', p_off_weekends: f.get('allday') === 'on' && f.get('offwk') === 'on',
+          p_all_day: f.get('allday') === 'on', p_off_weekends: false,
         });
         if (error) throw error;
         await loadTeam(); await loadMonth(); renderApp(); await openEventsSheet();
@@ -1247,7 +1373,7 @@ async function loadCoverCounts(per) {
   map.days = [];
   for (const o of data || []) {
     const jo = joAt(o.user_id, o.work_date);
-    if (!o.is_cover && (!jo || S.baseShift(state.team, jo, o.work_date) !== 'O')) continue;
+    if (!o.is_cover && (!jo || S.baseShift(teamFor(o.user_id), jo, o.work_date) !== 'O')) continue;
     map.days.push(o);
     const r = map.get(o.user_id) || { n: 0, d: 0, nt: 0, app: 0 };
     r.n++; if (o.shift === 'D') r.d++; else r.nt++; if (o.is_cover) r.app++;
@@ -1536,7 +1662,7 @@ function viewTeam() {
     return `<button class="cell tcell ${iso === today ? 'today' : ''}" data-action="team-day" data-iso="${iso}">
       ${cellHead(iso, dow, mine.shift === 'D' || mine.shift === 'N' ? `<i class="me-dot s-${mine.shift}"></i>` : '')}
       ${S.dayPeriodOn(state.team, iso)
-        ? `<span class="duty all">${duty.D.length ? '<i class="d all">전원</i>' : '<i class="o all">휴무</i>'}</span>`
+        ? `<span class="duty">${duty.D.map((j) => `<i class="d${S.patternShift(state.team, j, iso) === 'N' ? ' conv' : ''}">${j}</i>`).join('')}</span>`
         : `<span class="duty"><i class="d${st?.D ? ' short' : ''}"${st?.D ? ` data-s="-${st.D}"` : ''}>${duty.D.join('')}</i><i class="n${st?.N ? ' short' : ''}"${st?.N ? ` data-s="-${st.N}"` : ''}>${duty.N.join('')}</i></span>`}
       ${open ? `<span class="pill open">대근${open}</span>` : assigned ? `<span class="pill assigned">지정${assigned}</span>` : filled ? `<span class="pill filled">확정${filled}</span>` : ''}
       ${eventStrip(iso)}
@@ -1561,7 +1687,7 @@ function viewTeam() {
     ${WEEK_HEAD}
     <div class="grid team ${slideCls()}">${cells}</div>
     <p class="legend"><span class="duty inline"><i class="d">A</i></span>주간 조 <span class="duty inline"><i class="n">D</i></span>야간 조
-      ${state.team.day_periods.some((p) => p.start_date <= S.monthRange(y, m).end && p.end_date >= S.monthRange(y, m).start) ? '<span class="duty inline all"><i class="d all">전원</i></span>4개조 일시 주간' : ''}
+      ${state.team.day_periods.some((p) => p.start_date <= S.monthRange(y, m).end && p.end_date >= S.monthRange(y, m).start) ? '<span class="duty inline"><i class="d conv">B</i></span>야간조 일시 주간' : ''}
       <span class="pill open">대근</span>필요 <span class="pill assigned">지정</span>확인 대기 <span class="pill filled">확정</span>완료 <i class="me-dot s-D inline"></i>내 근무
       ${crewSize() ? `<span class="duty inline"><i class="d short" data-s="-1">A</i></span>인원부족 (정원 ${crewSize()}명)` : ''}</p>`;
 }
@@ -1675,8 +1801,9 @@ function openTeamSheet(iso) {
   const duty = S.josOnDuty(state.team, iso);
 
   const sh = openSheet(`
-    <h3>${S.formatDay(iso)}${holidayTag(iso)} <small class="muted">${S.dayPeriodOn(state.team, iso) ? (duty.D.length ? '4개조 전원 일시 주간' : '전원 주간 기간 · 휴무일') : `주간 ${duty.D.join('')}조 · 야간 ${duty.N.join('')}조`}</small></h3>
+    <h3>${S.formatDay(iso)}${holidayTag(iso)} <small class="muted">${S.dayPeriodOn(state.team, iso) ? `일시 주간 · 주간 ${duty.D.join('·')}조 (야간 없음)` : `주간 ${duty.D.join('')}조 · 야간 ${duty.N.join('')}조`}</small></h3>
     ${eventsLine(iso)}
+    ${S.dayPeriodOn(state.team, iso) && groups.N.length ? '<p class="muted small-note">야간에 보이는 사람은 일시 주간을 아직 반영하지 않았거나 "그대로"를 고른 사람이에요.</p>' : ''}
     ${pollsLine(iso)}
     ${absReqs.length || otherVac.length ? `<section class="sec"><h4>자리 비움 · 대근</h4>
       ${absReqs.map(reqCard).join('')}
@@ -1719,26 +1846,28 @@ function openAssignSheet(iso, shift, r) {
   const prev = S.addDays(iso, -1); const next = S.addDays(iso, 1);
   const sh = openSheet(`<h3>대근자 지정 <small class="muted">${S.formatDay(iso)} ${S.SHIFT_INFO[shift].label}</small></h3>
     <p class="muted small-note">${r?.kind === 'absence' || (r && r.requester_id) ? `${esc(memberName(r.requester_id))} 자리 · ` : '인원부족 · '}그날 쉬는 사람만 보여요. 이번 기간 대근 적은 순.</p>
-    <p class="note">지원자를 고르면 바로 확정되고, 지원 안 한 사람을 고르면 그 사람이 <b>확인</b>을 눌러야 확정돼요.</p>
+    <p class="note">지원자나 <b>나 자신</b>을 고르면 바로 확정되고, 지원 안 한 사람을 고르면 그 사람이 <b>확인</b>을 눌러야 확정돼요.</p>
     ${list.length ? `<div class="assign-list">${list.map(({ mm, n, vol }) => {
       const p = shiftOf(mm, prev).shift; const nx = shiftOf(mm, next).shift;
       const warn = (shift === 'D' && p === 'N') ? '전날 야간' : (shift === 'N' && nx === 'D') ? '다음 날 주간' : '';
       return `<button class="assign-item" data-pick="${mm.user_id}"><span><b>${esc(mm.display_name)}</b> <small>${curJo(mm) ?? ''}조</small>
-        ${vol ? '<em class="vol-tag">지원함</em>' : ''}${warn ? `<em class="warn-tag">${warn}</em>` : ''}</span><span class="muted">대근 ${n}회</span></button>`;
+        ${mm.user_id === state.user.id ? '<em class="vol-tag">나</em>' : ''}${vol ? '<em class="vol-tag">지원함</em>' : ''}${warn ? `<em class="warn-tag">${warn}</em>` : ''}</span><span class="muted">대근 ${n}회</span></button>`;
     }).join('')}</div>` : '<p class="muted small-note">그날 쉬는 반원이 없어요.</p>'}
     <div class="row-btns"><button class="btn ghost block" data-back>돌아가기</button></div>`, { type: 'assign' });
   sh.querySelector('[data-back]').onclick = () => openTeamSheet(iso);
   sh.querySelectorAll('[data-pick]').forEach((b) => {
     b.onclick = async () => {
-      const uid = b.dataset.pick; const vol = vols.has(uid);
-      if (!(await confirmModal(vol ? `지원자 ${memberName(uid)}님으로 대근을 확정할까요?` : `${memberName(uid)}님을 대근자로 지정할까요? 그분이 확인을 누르면 확정돼요.`, vol ? '확정' : '지정'))) return;
+      const uid = b.dataset.pick; const self = uid === state.user.id; const vol = vols.has(uid) || self;
+      const msg = self ? '내가 이 대근을 맡을까요? 바로 확정되고 내 달력에 "대근"으로 들어가요.'
+        : vol ? `지원자 ${memberName(uid)}님으로 대근을 확정할까요?` : `${memberName(uid)}님을 대근자로 지정할까요? 그분이 확인을 누르면 확정돼요.`;
+      if (!(await confirmModal(msg, vol ? '확정' : '지정'))) return;
       await withBusy(async () => {
         try {
           const { data, error } = r ? await sb.rpc('assign_cover', { p_request: r.id, p_user: uid })
             : await sb.rpc('assign_shortage', { p_date: iso, p_shift: shift, p_user: uid });
           if (error) throw error;
           await loadMonth(); renderApp(); openTeamSheet(iso);
-          toast(data === 'filled' ? `${memberName(uid)}님으로 확정했어요` : `${memberName(uid)}님에게 지정했어요. 확인을 기다려요`);
+          toast(data === 'filled' ? (self ? '내 대근으로 확정했어요' : `${memberName(uid)}님으로 확정했어요`) : `${memberName(uid)}님에게 지정했어요. 확인을 기다려요`);
         } catch (e) { toastErr(e); }
       });
     };
@@ -1788,9 +1917,10 @@ async function fillInfo() {
   const pay = statMode() === 'pay';
   const { start, end } = pay ? payRange(y, m) : S.monthRange(y, m);
   const myJoAt = (iso) => joAt(state.user.id, iso);
-  const ms = S.periodStats(state.team, myJoAt, start, end, map);
-  const ys = pay ? S.periodStats(state.team, myJoAt, `${y - 1}-12-16`, `${y}-12-15`, map)
-    : S.periodStats(state.team, myJoAt, `${y}-01-01`, `${y}-12-31`, map);
+  const myTeam = teamFor(state.user.id);
+  const ms = S.periodStats(myTeam, myJoAt, start, end, map);
+  const ys = pay ? S.periodStats(myTeam, myJoAt, `${y - 1}-12-16`, `${y}-12-15`, map)
+    : S.periodStats(myTeam, myJoAt, `${y}-01-01`, `${y}-12-31`, map);
   const absTotal = ['V', 'E', 'H', 'T', 'R'].reduce((t, k) => t + ms.abs[k], 0);
   const absTile = `<div class="tile"><span class="muted">비근무</span><b>${absTotal}<small>일</small></b>
     <span class="abs-grid">${['V', 'E', 'H', 'R', 'T'].map((k) => `<span class="${ms.abs[k] ? '' : 'zero'}">${S.SHIFT_INFO[k].label} <b>${ms.abs[k]}</b></span>`).join('')}</span></div>`;
